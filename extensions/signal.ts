@@ -2,7 +2,7 @@
 // TypeScript types are provided by pi at runtime via jiti.
 // This extension uses runtime-only imports; type checking is skipped.
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -29,12 +29,23 @@ const PI_SIGNAL_PRIMARY =
 	process.env.PI_SIGNAL_PRIMARY === "1" ||
 	process.env.PI_SIGNAL_PRIMARY === "yes";
 
+// Default stats mode: "off" | "short" | "full"
+const DEFAULT_STATS_MODE = (
+	process.env.PI_SIGNAL_STATS || "short"
+).toLowerCase();
+
 // ── Extension ──────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
 	// Native-mode state
 	let fileWatcher: fs.FSWatcher | null = null;
 	let lastPosition = 0;
+
+	// Resolved Signal UUID (ACI) for our own account — resolves from
+	// phone number to UUID at startup via listContacts RPC. Using the
+	// UUID rather than the raw phone number in recipient triggers
+	// signal-cli's sendSelfMessage() path → grey (synced) bubbles.
+	let resolvedAccountId: string | null = null;
 
 	// Pending reaction (Note-to-Self feedback cycle)
 	let pendingReaction: {
@@ -50,6 +61,17 @@ export default function (pi: ExtensionAPI) {
 		sender: string;
 		timestamp: number;
 	} | null = null;
+
+	// ── Feature state ────────────────────────────────────────────────
+
+	/** Stored extension context (captured from session_start) for command handling */
+	let extCtx: ExtensionContext | null = null;
+
+	/** Stats verbosity mode. Can be changed via /stats command. */
+	let statsMode: "off" | "short" | "full" =
+		DEFAULT_STATS_MODE === "full" ? "full"
+		: DEFAULT_STATS_MODE === "off" ? "off"
+		: "short";
 
 	// ── Helpers ──────────────────────────────────────────────────────
 
@@ -170,20 +192,348 @@ export default function (pi: ExtensionAPI) {
 		return { sender, number, body: body.trim(), timestamp };
 	}
 
-	function injectMessage(parsed: {
+	// ── Command Handlers ────────────────────────────────────────────
+
+	/** Build a stats footer string for the current context. */
+	function buildStatsFooter(
+		ctx: ExtensionContext | null,
+	): string {
+		if (!ctx || statsMode === "off") return "";
+
+		const usage = ctx.getContextUsage?.();
+		const model = ctx.model;
+		const modelName = model?.name || model?.id || "unknown";
+		const provider = model?.provider || "";
+
+		const tokensIn = usage?.tokens != null ? usage.tokens : null;
+		const ctxWindow = usage?.contextWindow || null;
+		const pct = usage?.percent != null ? usage.percent : null;
+
+		if (statsMode === "short") {
+			// e.g. "───\nClaude Sonnet 4 · 1.2K ctx · 24%"
+			const parts: string[] = [modelName];
+			if (tokensIn != null) {
+				parts.push(formatTokens(tokensIn) + " ctx");
+			}
+			if (pct != null) {
+				parts.push(Math.round(pct) + "%");
+			}
+			return "\n───\n" + parts.join(" · ");
+		}
+
+		// Full mode
+		const lines: string[] = ["───"];
+		lines.push(`Model: ${modelName}${provider ? " (" + provider + ")" : ""}`);
+		if (tokensIn != null) {
+			lines.push(`Context: ${tokensIn.toLocaleString()} tokens`);
+		}
+		if (ctxWindow != null) {
+			lines.push(`Window: ${ctxWindow.toLocaleString()} tokens`);
+		}
+		if (pct != null) {
+			lines.push(`Usage: ${Math.round(pct)}%`);
+		}
+		return "\n" + lines.join("\n");
+	}
+
+	function formatTokens(n: number): string {
+		if (n >= 1000) return (n / 1000).toFixed(1) + "K";
+		return String(n);
+	}
+
+	/** Simple Levenshtein distance between two strings. */
+	function levenshtein(a: string, b: string): number {
+		const m = a.length;
+		const n = b.length;
+		const dp: number[][] = [];
+		for (let i = 0; i <= m; i++) {
+			dp[i] = [i];
+		}
+		for (let j = 0; j <= n; j++) {
+			dp[0][j] = j;
+		}
+		for (let i = 1; i <= m; i++) {
+			for (let j = 1; j <= n; j++) {
+				dp[i][j] = a[i - 1] === b[j - 1]
+					? dp[i - 1][j - 1]
+					: Math.min(dp[i - 1][j - 1], dp[i][j - 1], dp[i - 1][j]) + 1;
+			}
+		}
+		return dp[m][n];
+	}
+
+	/**
+	 * Fuzzy-match a partial query against a list of model labels.
+	 * Returns sorted matches with scores (0 = exact, higher = worse).
+	 */
+	function fuzzyMatchModels(
+		query: string,
+		models: Array<{ label: string; model: unknown }>,
+	): Array<{ label: string; model: unknown; score: number }> {
+		const q = query.toLowerCase().trim();
+		if (!q) return [];
+
+		const scored: Array<{ label: string; model: unknown; score: number }> = [];
+
+		for (const entry of models) {
+			const label = entry.label.toLowerCase();
+			let score = Infinity;
+
+			// Exact match (case-insensitive)
+			if (label === q) {
+				score = 0;
+			} else if (label.includes(q)) {
+		// Substring match — strong signal with slight position bonus
+		const pos = label.indexOf(q);
+		score = 0.02 + (pos / Math.max(label.length, 1)) * 0.05;
+			} else {
+				// Levenshtein distance normalized by max length
+				const dist = levenshtein(label, q);
+				const maxLen = Math.max(label.length, q.length);
+				score = dist / Math.max(maxLen, 1);
+			}
+
+			scored.push({ label: entry.label, model: entry.model, score });
+		}
+
+		// Sort by score ascending, then by label length (prefer shorter matches)
+		scored.sort((a, b) => {
+			if (a.score !== b.score) return a.score - b.score;
+			return a.label.length - b.label.length;
+		});
+
+		return scored;
+	}
+
+	/** Get all available models from context, formatted as {label, model} entries. */
+	function getModelList(ctx: ExtensionContext): Array<{ label: string; model: unknown }> {
+		const registry = ctx.modelRegistry;
+		if (!registry || typeof registry.getAll !== "function") return [];
+
+		try {
+			const models = registry.getAll() as Array<{
+				provider?: string;
+				id?: string;
+				name?: string;
+			}>;
+			return models.map((m) => ({
+				label: `${m.name || m.id || "unknown"} (${m.provider || "?"}/${m.id || "?"})`,
+				model: m,
+			}));
+		} catch {
+			return [];
+		}
+	}
+
+	/** Handle a Signal message that is a command (/model, /abort, /clear, /stats). */
+	async function handleCommand(
+		parsed: { sender: string; number: string; body: string; timestamp: number },
+		cmd: string,
+		args: string[],
+	): Promise<void> {
+		const ctx = extCtx;
+		if (!ctx) {
+			// Can't handle commands without context — forward to LLM
+			forwardToAgent(parsed);
+			return;
+		}
+
+		const reply = (text: string) => {
+			currentSignalSender = {
+				number: parsed.number,
+				sender: parsed.sender,
+				timestamp: parsed.timestamp,
+			};
+			// Use sendToSignal directly since we're handling inline
+			sendToSignal(parsed.number, text).then((ok) => {
+				if (ok) {
+					console.log(`[signal] command reply sent: ${cmd}`);
+				} else {
+					console.error(`[signal] failed to send command reply: ${cmd}`);
+				}
+			}).finally(() => {
+				currentSignalSender = null;
+			});
+		};
+
+		switch (cmd) {
+			case "model":
+				return handleModelCommand(ctx, args, reply);
+			case "abort":
+				return handleAbortCommand(ctx, parsed, reply);
+			case "clear":
+				return handleClearCommand(ctx, parsed, reply);
+			case "stats":
+				return handleStatsCommand(parsed, args, reply);
+			case "ping":
+				return handlePingCommand(parsed, reply);
+			case "help":
+				return handleHelpCommand(parsed, reply);
+			default:
+				// Unknown command — forward to LLM as normal message
+				forwardToAgent(parsed);
+		}
+	}
+
+	/** /model <partial_name> — fuzzy-match and switch model */
+	async function handleModelCommand(
+		ctx: ExtensionContext,
+		args: string[],
+		reply: (text: string) => void,
+	): Promise<void> {
+		const query = args.join(" ").trim();
+		if (!query) {
+			const current = ctx.model;
+			const name = current?.name || current?.id || "unknown";
+			reply(`Current model: ${name} (${current?.provider || "?"})\n\nUsage: /model <partial name>\nExamples: /model claude, /model gpt, /model sonnet`);
+			return;
+		}
+
+		const models = getModelList(ctx);
+		if (models.length === 0) {
+			reply("No models available. Configure a provider first.");
+			return;
+		}
+
+		const matches = fuzzyMatchModels(query, models);
+
+		// Check for exact model ID match before fuzzy matching
+		const qLower = query.toLowerCase().trim();
+		for (const entry of models) {
+			const entryObj = entry.model as { id?: string };
+			if (entryObj.id && entryObj.id.toLowerCase() === qLower) {
+				const ok = await pi.setModel(entry.model as any);
+				if (ok) {
+					reply(`Switched to ${entry.label}`);
+				} else {
+					reply(`Failed to switch to ${entry.label}. Check API key configuration.`);
+				}
+				return;
+			}
+		}
+
+		// Filter to reasonable matches (score < 0.5)
+		const good = matches.filter((m) => m.score < 0.5);
+		if (good.length === 0) {
+			// Show closest few
+			const closest = matches.slice(0, 5);
+			const lines = closest.map(
+				(m, i) => `${i + 1}. ${m.label}`,
+			);
+			reply(
+				`No close match for "${query}". Did you mean:\n${lines.join("\n")}`,
+			);
+			return;
+		}
+
+		// If exact or very close match (score < 0.15), switch immediately
+		const best = good[0];
+		if (good.length === 1 && best.score < 0.15) {
+			const ok = await pi.setModel(best.model as any);
+			if (ok) {
+				reply(`Switched to ${best.label}`);
+			} else {
+				reply(`Failed to switch to ${best.label}. Check API key configuration.`);
+			}
+			return;
+		}
+
+		// Multiple matches — show options
+		const show = good.slice(0, 10);
+		const lines = show.map((m, i) => `${i + 1}. ${m.label}`);
+		reply(
+			`Multiple matches for "${query}":\n${lines.join("\n")}\n\nSend a more specific query.`,
+		);
+	}
+
+	/** /abort — stop the current LLM generation */
+	async function handleAbortCommand(
+		ctx: ExtensionContext,
+		parsed: { sender: string; number: string; body: string; timestamp: number },
+		reply: (text: string) => void,
+	): Promise<void> {
+		if (ctx.isIdle()) {
+			reply("Nothing to abort — the agent is idle.");
+			return;
+		}
+
+		ctx.abort();
+		reply("⏹ Response aborted.");
+
+		// Swap 👀 → 🛑 on the original message
+		if (parsed.timestamp) {
+			await removeReaction(parsed.number, parsed.number, parsed.timestamp);
+			await sendReaction(parsed.number, parsed.number, parsed.timestamp, "🛑");
+		}
+	}
+
+	/** /clear — start a new session */
+	async function handleClearCommand(
+		ctx: ExtensionContext,
+		parsed: { sender: string; number: string; body: string; timestamp: number },
+		reply: (text: string) => void,
+	): Promise<void> {
+		// If currently streaming, abort first
+		if (!ctx.isIdle()) {
+			ctx.abort();
+			// Small wait to let abort settle
+			await new Promise((r) => setTimeout(r, 300));
+		}
+
+		reply("🧹 Starting new session…");
+
+		try {
+			if (typeof (ctx as any).newSession === "function") {
+				await (ctx as any).newSession({
+					withSession: async (_newCtx: unknown) => {
+						console.log("[signal] new session started via /clear");
+					},
+				});
+			} else {
+				console.log("[signal] newSession not available on context");
+			}
+		} catch (err) {
+			console.error("[signal] /clear error:", err);
+		}
+	}
+
+	/** /stats [short|full|off] — view or change stats mode */
+	async function handleStatsCommand(
+		parsed: { sender: string; number: string; body: string; timestamp: number },
+		args: string[],
+		reply: (text: string) => void,
+	): Promise<void> {
+		const arg = args[0]?.toLowerCase();
+
+		if (!arg) {
+			// Show current stats mode and usage
+			const ctx = extCtx;
+			let usageLine = "";
+			if (ctx) {
+				const usage = ctx.getContextUsage?.();
+				if (usage?.percent != null) {
+					usageLine = ` · ${Math.round(usage.percent)}% context used`;
+				}
+			}
+			reply(`Stats mode: ${statsMode}${usageLine}\n\nUsage:\n/stats short — enable short stats (default)\n/stats full  — enable full stats\n/stats off   — disable stats`);
+			return;
+		}
+
+		if (arg === "short" || arg === "full" || arg === "off") {
+			statsMode = arg;
+			reply(`Stats mode set to: ${arg}`);
+		} else {
+			reply(`Invalid stats mode "${arg}". Use: short, full, off`);
+		}
+	}
+
+	/** Forward a message to the LLM agent (normal flow). */
+	function forwardToAgent(parsed: {
 		sender: string;
 		number: string;
 		body: string;
 		timestamp: number;
 	}) {
-		// Only process Note-to-Self messages (from own account)
-		if (parsed.number !== PI_SIGNAL_ACCOUNT) {
-			console.log(
-				`[signal] ignoring message from ${parsed.number} (not PI_SIGNAL_ACCOUNT)`,
-			);
-			return;
-		}
-
 		// Track sender context for auto-response
 		currentSignalSender = {
 			number: parsed.number,
@@ -207,6 +557,62 @@ export default function (pi: ExtensionAPI) {
 
 		const formatted = `[Signal from ${parsed.sender} (${parsed.number})]: ${parsed.body}`;
 		pi.sendUserMessage(formatted, { deliverAs: "followUp" });
+	}
+
+	/** /ping — test connectivity */
+	async function handlePingCommand(
+		parsed: { sender: string; number: string; body: string; timestamp: number },
+		reply: (text: string) => void,
+	): Promise<void> {
+		reply("pong");
+	}
+
+	/** /help — list available commands */
+	async function handleHelpCommand(
+		parsed: { sender: string; number: string; body: string; timestamp: number },
+		reply: (text: string) => void,
+	): Promise<void> {
+		reply(
+			"Available commands:\n" +
+			"/model <name> — switch model (fuzzy match)\n" +
+			"/abort — stop current generation\n" +
+			"/clear — start new session\n" +
+			"/stats [short|full|off] — toggle usage stats\n" +
+			"/ping — test connectivity\n" +
+			"/help — show this help",
+		);
+	}
+
+	/** Intercept commands from Signal: /model, /abort, /clear, /stats, /ping, /help */
+	function injectMessage(parsed: {
+		sender: string;
+		number: string;
+		body: string;
+		timestamp: number;
+	}) {
+		// Only process Note-to-Self messages (from own account)
+		if (parsed.number !== PI_SIGNAL_ACCOUNT) {
+			console.log(
+				`[signal] ignoring message from ${parsed.number} (not PI_SIGNAL_ACCOUNT)`,
+			);
+			return;
+		}
+
+		const body = parsed.body.trim();
+
+		// Check for commands
+		if (body.startsWith("/")) {
+			const parts = body.slice(1).split(/\s+/);
+			const cmd = parts[0].toLowerCase();
+			const args = parts.slice(1);
+			handleCommand(parsed, cmd, args).catch((err) => {
+				console.error(`[signal] command error (${cmd}):`, err);
+			});
+			return;
+		}
+
+		// Normal message — forward to agent
+		forwardToAgent(parsed);
 	}
 
 	// ── Daemon JSON-RPC helpers ──────────────────────────────────────
@@ -298,6 +704,10 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		// Resolve our phone number to a Signal UUID so outgoing messages
+		// use the recipient-based sync path (grey bubbles instead of blue).
+		resolvedAccountId = await resolveAccountId();
+
 		const logPath = await ensureLogfile();
 
 		try {
@@ -348,28 +758,75 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	// ── Account ID resolution ──────────────────────────────────────
+
+	/**
+	 * Resolve our own phone number (PI_SIGNAL_ACCOUNT) to a Signal UUID
+	 * by calling the listContacts RPC.  Using the UUID (ACI) rather than
+	 * the raw phone number in the `recipient` array is the key to getting
+	 * signal-cli's `sendSelfMessage()` path to fire, which produces grey
+	 * (synced) bubbles instead of blue (outgoing) ones.
+	 *
+	 * This mirrors what hermes-agent does:
+	 * https://github.com/NousResearch/hermes-agent/blob/main/gateway/platforms/signal.py
+	 */
+	async function resolveAccountId(): Promise<string | null> {
+		if (!PI_SIGNAL_ACCOUNT) return null;
+
+		const res = await daemonRpc("listContacts", {
+			account: PI_SIGNAL_ACCOUNT,
+			allRecipients: true,
+		});
+		if (!res.ok || !Array.isArray(res.result)) {
+			console.log("[signal] listContacts failed — falling back to phone number");
+			return null;
+		}
+
+		const contacts = res.result as Array<Record<string, unknown>>;
+		for (const contact of contacts) {
+			const number = contact.number as string | undefined;
+			if (number && number === PI_SIGNAL_ACCOUNT) {
+				// Try uuid first, then aci (older signal-cli uses "uuid")
+				const uuid = (contact.uuid as string) || (contact.aci as string) || null;
+				if (uuid) {
+					console.log(`[signal] resolved account UUID: ${uuid}`);
+					return uuid;
+				}
+			}
+		}
+
+		console.log("[signal] account not found in contacts — falling back to phone number");
+		return null;
+	}
+
 	// ── Send response back to Signal ──────────────────────────────
 
 	/**
 	 * Send a text message back to Signal via the daemon JSON-RPC API.
 	 * Used for auto-replying with the agent's response.
 	 *
-	 * Color note (Note-to-Self): signal-cli has two delivery paths when the
-	 * recipient is self. The default (notifySelf omitted / false) wraps the
-	 * message in a SentTranscriptMessage and sends it as a
-	 * SignalServiceSyncMessage — your phone renders that as a synced message
-	 * from another linked device, i.e. **grey**. Setting notifySelf: true
-	 * sends a normal outgoing dataMessage instead, which renders **blue**.
+	 * Color note (Note-to-Self): to make replies show up **grey** (as if
+	 * synced from another linked device) we send with `recipient` set to
+	 * the account number and let signal-cli's own self-detection route the
+	 * message through `SendHelper.sendSelfMessage()`. That method wraps the
+	 * message in a `SentTranscriptMessage` and delivers it as a
+	 * `SignalServiceSyncMessage`, which the phone app renders as grey.
 	 *
-	 * We always want grey for auto-replies so the conversation reads as
-	 * alternating sides. `noteToSelf: true` is used instead of `recipient`
-	 * because it makes the self-routing explicit (signal-cli doesn't have to
-	 * run the RecipientAddress.matches() self-check).
+	 * Do NOT use `noteToSelf` — it bypasses the `sendSelfMessage()` path on
+	 * some signal-cli versions and falls through to a normal outgoing
+	 * dataMessage, which renders **blue** (as if you typed it).
+	 *
+	 * Do NOT use `notifySelf: true` — that also forces the outgoing
+	 * dataMessage path (blue).
 	 *
 	 * Prerequisite: the Signal phone app must be a separate linked device
-	 * from the daemon. If you only have one device, `sendSelfMessage` in
-	 * signal-cli's SendHelper is a no-op (`!account.isMultiDevice()` guard)
-	 * and the message will fall through to the normal outgoing path (blue).
+	 * from the daemon (multi-device). If you only have one device,
+	 * `sendSelfMessage` in signal-cli's SendHelper is a no-op
+	 * (`!account.isMultiDevice()` guard) and the message will fall through
+	 * to the normal outgoing path (blue).
+	 *
+	 * This approach matches what hermes-agent does (see
+	 * https://github.com/NousResearch/hermes-agent/blob/main/gateway/platforms/signal.py).
 	 */
 	async function sendToSignal(
 		_recipient: string,
@@ -386,12 +843,15 @@ export default function (pi: ExtensionAPI) {
 				"\n\n[truncated — response too long for Signal]";
 		}
 
-		// Force the sync-message path so replies show up grey (synced from
-		// another device) instead of blue (outgoing from your own number).
+		// Use the resolved UUID (if available) so signal-cli's self-detection
+		// kicks in and routes through sendSelfMessage → grey (synced) rendering.
+		// Include the `account` parameter as signal-cli needs it to know which
+		// linked device to act as.
+		const targetId = resolvedAccountId || PI_SIGNAL_ACCOUNT;
 		const res = await daemonRpc("send", {
-			noteToSelf: true,
+			account: PI_SIGNAL_ACCOUNT,
+			recipient: [targetId],
 			message: text,
-			notifySelf: false,
 		});
 		return res.ok;
 	}
@@ -399,11 +859,13 @@ export default function (pi: ExtensionAPI) {
 	// ── Lifecycle ─────────────────────────────────────────────────────
 
 	pi.on("session_start", async (_event: unknown, ctx: unknown) => {
+		// Store context for command handlers
+		extCtx = ctx as ExtensionContext | null;
 		await startNativeMode(ctx);
 	});
 
-	// Auto-send agent responses back to Signal
-	pi.on("agent_end", async (event: unknown) => {
+	// Auto-send agent responses back to Signal, with stats footer
+	pi.on("agent_end", async (event: unknown, ctx: unknown) => {
 		if (!currentSignalSender) return;
 
 		const sender = currentSignalSender;
@@ -438,8 +900,16 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			const fullText = textParts.join("\n").trim();
+			let fullText = textParts.join("\n").trim();
 			if (!fullText) return;
+
+			// Append stats footer if enabled
+			if (statsMode !== "off") {
+				const statsFooter = buildStatsFooter(ctx as ExtensionContext | null);
+				if (statsFooter) {
+					fullText += statsFooter;
+				}
+			}
 
 			const ok = await sendToSignal(sender.number, fullText);
 			if (ok) {
@@ -468,6 +938,15 @@ export default function (pi: ExtensionAPI) {
 			}
 		} catch (err) {
 			console.error("[signal] auto-reply error:", err);
+		}
+	});
+
+	pi.on("model_select", async (event: unknown) => {
+		const ev = event as { model?: { name?: string; id?: string } };
+		if (ev?.model) {
+			console.log(
+				`[signal] model switched to ${ev.model.name || ev.model.id || "unknown"}`,
+			);
 		}
 	});
 
@@ -506,14 +985,16 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
-			// Force `notifySelf: false` so that if the recipient is the user
-			// themselves (Note-to-Self), signal-cli takes the sync-message path
-			// (grey) rather than the outgoing path (blue). For other
-			// recipients `notifySelf` has no effect.
+			// For self-recipient (Note-to-Self), use the resolved UUID so
+			// signal-cli routes through sendSelfMessage → grey (synced)
+			// rendering. Always include `account` — signal-cli needs it to
+			// identify which linked device to act as.
+			const isSelf = cleaned === PI_SIGNAL_ACCOUNT;
+			const targetId = isSelf && resolvedAccountId ? resolvedAccountId : cleaned;
 			const res = await daemonRpc("send", {
-				recipient: cleaned,
+				account: PI_SIGNAL_ACCOUNT,
+				recipient: [targetId],
 				message: params.message,
-				notifySelf: false,
 			});
 			if (!res.ok) {
 				throw new Error(
@@ -592,6 +1073,9 @@ export default function (pi: ExtensionAPI) {
 				lines.push(`incoming.log: not found at ${logPath}`);
 			}
 
+			// Add stats mode info
+			lines.push(`Stats mode: ${statsMode}`);
+
 			return {
 				content: [{ type: "text", text: lines.join("\n") }],
 				details: { lines },
@@ -599,7 +1083,85 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ── Command: /signal-setup ─────────────────────────────────
+	// ── Signal Commands (available in TUI) ───────────────────────
+
+	pi.registerCommand("signal-model", {
+		description:
+			"Switch to a model by fuzzy-matching a partial name. Examples: /signal-model claude, /signal-model sonnet",
+		async handler(args: string, ctx: unknown) {
+			const extensionCtx = ctx as ExtensionContext;
+			const models = getModelList(extensionCtx);
+			const query = args.trim();
+			if (!query) {
+				const current = extensionCtx.model;
+				const name = current?.name || current?.id || "unknown";
+				(extensionCtx.ui as any)?.notify?.(
+					`Current model: ${name} (${current?.provider || "?"})\nUsage: /signal-model <partial name>`,
+					"info",
+				);
+				return;
+			}
+
+			const matches = fuzzyMatchModels(query, models);
+			const best = matches.find((m) => m.score < 0.15);
+			if (best) {
+				const ok = await pi.setModel(best.model as any);
+				(extensionCtx.ui as any)?.notify?.(
+					ok ? `Switched to ${best.label}` : `Failed to switch to ${best.label}`,
+					ok ? "info" : "error",
+				);
+			} else {
+				const closest = matches.slice(0, 5).map((m) => m.label).join("\n");
+				(extensionCtx.ui as any)?.notify?.(
+					`No close match for "${query}". Closest:\n${closest}`,
+					"warning",
+				);
+			}
+		},
+	});
+
+	pi.registerCommand("signal-abort", {
+		description: "Stop the current LLM generation",
+		async handler(_args: string, ctx: unknown) {
+			const extensionCtx = ctx as ExtensionContext;
+			if (extensionCtx.isIdle()) {
+				(extensionCtx.ui as any)?.notify?.("Nothing to abort — agent is idle.", "info");
+				return;
+			}
+			extensionCtx.abort();
+			(extensionCtx.ui as any)?.notify?.("⏹ Response aborted.", "info");
+		},
+	});
+
+	pi.registerCommand("signal-stats", {
+		description: "View or toggle stats mode. Usage: /signal-stats [short|full|off]",
+		async handler(args: string, ctx: unknown) {
+			const extensionCtx = ctx as ExtensionContext;
+			const arg = args.trim().toLowerCase();
+			if (!arg) {
+				const usage = extensionCtx.getContextUsage?.();
+				const usageLine = usage?.percent != null
+					? ` · ${Math.round(usage.percent)}% context used`
+					: "";
+				(extensionCtx.ui as any)?.notify?.(
+					`Stats mode: ${statsMode}${usageLine}`,
+					"info",
+				);
+				return;
+			}
+			if (arg === "short" || arg === "full" || arg === "off") {
+				statsMode = arg;
+				(extensionCtx.ui as any)?.notify?.(`Stats mode set to: ${arg}`, "info");
+			} else {
+				(extensionCtx.ui as any)?.notify?.(
+					`Invalid stats mode "${arg}". Use: short, full, off`,
+					"error",
+				);
+			}
+		},
+	});
+
+	// ── Legacy Commands ─────────────────────────────────────────
 
 	pi.registerCommand("signal-setup", {
 		description:
@@ -616,8 +1178,6 @@ export default function (pi: ExtensionAPI) {
 			await setupNativeMode(extensionCtx);
 		},
 	});
-
-	// ── Command: /signal-start ──────────────────────────────
 
 	pi.registerCommand("signal-start", {
 		description:
@@ -643,10 +1203,10 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ── Command: /signal-stop ───────────────────────────────
-
 	pi.registerCommand("signal-stop", {
-		description: "Stop the Signal message-receive systemd service",
+		description:
+			"⚠️ Stop the Signal message-receive systemd service. " +
+			"WARNING: pi will no longer receive incoming Signal messages until /signal-start is run.",
 		async handler(_args: string, ctx: unknown) {
 			const extensionCtx = ctx as {
 				ui?: { notify: (msg: string, level: string) => void };
@@ -658,7 +1218,10 @@ export default function (pi: ExtensionAPI) {
 				{ timeout: 15_000 },
 			);
 			if (result.code === 0) {
-				extensionCtx.ui?.notify?.("signal-receive.service stopped.", "info");
+				extensionCtx.ui?.notify?.(
+					"⚠️ signal-receive.service stopped. pi will not receive Signal messages until /signal-start is run.",
+					"warning",
+				);
 			} else {
 				extensionCtx.ui?.notify?.(
 					`Failed to stop service: ${result.stderr || result.stdout}`,
@@ -668,11 +1231,9 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ── Command: /signal-status ──────────────────────────────
-
 	pi.registerCommand("signal-status", {
 		description:
-			"Show Signal integration status (account, service health)",
+			"Show Signal integration status (account, service health, stats mode)",
 		async handler(_args: string, ctx: unknown) {
 			const extensionCtx = ctx as {
 				ui?: { notify: (msg: string, level: string) => void };
@@ -696,6 +1257,8 @@ export default function (pi: ExtensionAPI) {
 			statusLines.push(
 				`incoming.log: ${logExists ? `${logSize} bytes` : "not found"}`,
 			);
+
+			statusLines.push(`Stats mode: ${statsMode}`);
 
 			const msg = [
 				`Account: ${PI_SIGNAL_ACCOUNT || "(not set)"}`,
