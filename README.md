@@ -10,26 +10,23 @@ Connect [pi](https://pi.dev) to [Signal Messenger](https://signal.org/) for two-
 pi install npm:@aalzubidy/pi-signal
 ```
 
-For a temporary test run (no install):
-
-```bash
-pi -e npm:@aalzubidy/pi-signal
-```
-
 ## Quick Start
 
-**Prerequisites:** Linux with systemd, Java 25+ ([adoptium.net](https://adoptium.net/)), [signal-cli](https://github.com/AsamK/signal-cli/wiki/Quickstart) in PATH, Signal app on your phone.
+**Prerequisites:** [signal-cli](https://github.com/AsamK/signal-cli/) in PATH, Signal app on your phone.
 
 ```bash
-# 1. Run the setup wizard
-bash scripts/setup.sh        # links device, creates systemd service
+# 1. Run the setup wizard - it might need sudo because it creates the systemd file
+bash scripts/setup.sh        #  Guide you to setup signal-cli, links device, creates systemd service
 
 # 2. Set your phone number
-export PI_SIGNAL_ACCOUNT=+1234567890   # add to ~/.profile
+export PI_SIGNAL_ACCOUNT=+1234567890   # or add to ~/.bashrc
 
 # 3. Install and restart pi
 pi install npm:@aalzubidy/pi-signal
+
+# 4. Ensure one instance of pi is the primary - DO NOT SET IT ON PROFILE LEVEL
 # Then restart pi or run /reload
+export PI_SIGNAL_PRIMARY=true && pi
 ```
 
 Send a Note-to-Self from your phone. pi receives it (👀), processes it, and replies automatically (✅).
