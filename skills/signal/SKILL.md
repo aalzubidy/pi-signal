@@ -8,7 +8,7 @@ description: >
 
 # Signal ↔ pi Integration
 
-Two-way messaging between pi and Signal via signal-cli daemon with SSE streaming.
+Two-way messaging between pi and Signal via signal-cli daemon with in-memory SSE streaming.
 
 ## Prerequisites
 
@@ -59,19 +59,21 @@ Send a Note-to-Self message from your phone. pi receives it and responds.
 ```
 signal-cli daemon (-a NUMBER --http 127.0.0.1:8080)
   ├── SSE endpoint: /api/v1/events?account=+NUMBER
-  │   └── Streams incoming messages (including Note-to-Self / syncMessage)
+  │   └── Streams incoming messages in-memory (no log file)
   └── RPC endpoint: /api/v1/rpc
       └── JSON-RPC 2.0 for send, sendReaction, etc.
 
 signal-receive-loop.sh
   ├── Starts daemon in single-account mode (-a NUMBER)
-  ├── Pipes SSE stream through while-read loop
+  ├── Monitors daemon health (periodic HTTP check)
   ├── Waits for port 8080 TIME_WAIT drain before restart
-  ├── Parses data: lines, extracts JSON
-  └── Appends to incoming.log
+  └── Restarts daemon on failure — no log file written
 
 pi extension (signal.ts)
-  ├── fs.watch on incoming.log
+  ├── SSE HTTP stream (in-memory, no log file)
+  │   ├── Connects directly to daemon SSE endpoint
+  │   ├── Auto-reconnects with exponential backoff (2s–60s)
+  │   └── Parses data: lines, extracts JSON
   ├── parseEnvelope() — handles dataMessage + syncMessage
   ├── Sender filter — only PI_SIGNAL_ACCOUNT
   ├── React with 👀
@@ -87,6 +89,8 @@ pi extension (signal.ts)
 
 **Key architectural decision:** The daemon runs in **single-account mode** (`-a NUMBER`). This pre-loads the account at startup, avoiding `NotRegisteredException` that occurs in multi-account mode when the SSE endpoint tries to lazily load the account manager.
 
+**Security:** Messages are streamed in-memory via SSE — no message content is written to a log file on disk.
+
 ---
 
 ## Environment Variables
@@ -95,9 +99,11 @@ pi extension (signal.ts)
 |---|---|---|---|
 | `PI_SIGNAL_ACCOUNT` | Yes | — | Your Signal phone number, E.164 format: `+1234567890` |
 | `PI_SIGNAL_PRIMARY` | No | `false` | Set to `"true"` on the ONE instance that should handle Signal messages |
-| `PI_SIGNAL_DAEMON_URL` | No | `http://127.0.0.1:8080` | Daemon URL for JSON-RPC |
-| `PI_SIGNAL_INCOMING_LOG` | No | `~/.local/share/signal-cli/incoming.log` | Log file path |
+| `PI_SIGNAL_DAEMON_URL` | No | `http://127.0.0.1:8080` | Daemon URL for JSON-RPC and SSE |
 | `PI_SIGNAL_STATS` | No | `short` | Default stats mode: `off`, `short`, or `full` |
+| `PI_SIGNAL_QUIET_DAEMON` | No | `false` | Set to `"true"` to silence signal-cli daemon stdout (hides message content from `journalctl`). Default `false` — logs visible. |
+
+> **Note:** The `PI_SIGNAL_INCOMING_LOG` variable has been removed. Messages are now streamed in-memory via SSE for better security.
 
 ## Auto-Reply Behavior
 
@@ -105,7 +111,7 @@ pi extension (signal.ts)
 2. Message forwarded to LLM via `pi.sendUserMessage()`
 3. LLM responds → `agent_end` event fires
 4. Response auto-sent to Signal via daemon JSON-RPC
-   - Sends as **sync message** (`noteToSelf: true`, `notifySelf: false`) so it appears **grey** (synced from another device), not blue (outgoing). Requires the phone to be a separate linked device.
+   - Sends as **sync message** (recipient-based delivery with resolved UUID) so it appears **grey** (synced from another device), not blue (outgoing). Requires the phone to be a separate linked device.
 5. 👀 swapped to ✅ (or ❌ on failure)
 6. **Stats footer** appended after response (if `PI_SIGNAL_STATS != off`)
 
@@ -169,7 +175,7 @@ These are also available as slash commands in pi's interactive TUI mode:
 | `/signal-setup` | Interactive setup wizard |
 | `/signal-start` | Start systemd service |
 | `/signal-stop` | ⚠️ Stop systemd service (stops Signal message receiving) |
-| `/signal-status` | Show connection status, account, stats mode |
+| `/signal-status` | Show connection status, account, SSE stream status, stats mode |
 | `/signal-model <name>` | Switch model by fuzzy-matching partial name |
 | `/signal-abort` | Stop current LLM generation |
 | `/signal-stats [short\|full\|off]` | View or toggle stats mode |
@@ -202,15 +208,16 @@ Common issues:
 # Is the service running?
 sudo systemctl status signal-receive.service
 
-# Is incoming.log growing?
-tail -f ~/.local/share/signal-cli/incoming.log
-
 # Is the daemon healthy?
 curl -s http://127.0.0.1:8080/api/v1/check
 
 # Can the daemon serve the account?
 curl -s -N --max-time 3 "http://127.0.0.1:8080/api/v1/events?account=+YOUR_NUMBER"
+
+# Check pi's SSE connection status via /signal-status in pi
 ```
+
+> **Note:** There is no log file to tail. Messages are streamed in-memory via SSE directly from the daemon. Check `sudo journalctl -u signal-receive -f` and the pi extension logs for diagnostics.
 
 ### Commands not working
 
@@ -219,7 +226,7 @@ curl -s -N --max-time 3 "http://127.0.0.1:8080/api/v1/events?account=+YOUR_NUMBE
 
 ### General
 
-- `/signal-status` in pi — shows account, connection health, stats mode
+- `/signal-status` in pi — shows account, SSE connection health, stats mode
 - `signal-cli --version` — verify installation
 - `java -version` — verify Java 25+
 
@@ -230,6 +237,5 @@ curl -s -N --max-time 3 "http://127.0.0.1:8080/api/v1/events?account=+YOUR_NUMBE
 | File | Path |
 |---|---|
 | signal-cli data | `~/.local/share/signal-cli/data/` |
-| Incoming message log | `~/.local/share/signal-cli/incoming.log` |
 | Receive loop script | `/usr/local/bin/signal-receive-loop.sh` |
 | systemd service | `/etc/systemd/system/signal-receive.service` |
