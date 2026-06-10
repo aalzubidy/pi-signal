@@ -12,7 +12,7 @@
     "url": "https://github.com/aalzubidy/pi-signal/issues"
   },
   "author": "aalzubidy <aalzubidy@protonmail.com>",
-  "license": "MIT",
+  "license": "MPL-2.0",
   "pi": {
     "extensions": ["./extensions"],
     "skills": ["./skills"]
