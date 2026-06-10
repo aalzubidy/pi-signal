@@ -1,0 +1,34 @@
+{
+  "name": "@aalzubidy/pi-signal",
+  "version": "1.0.0",
+  "description": "Connect pi to Signal Messenger via native signal-cli daemon",
+  "keywords": ["pi-package"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aalzubidy/pi-signal.git"
+  },
+  "homepage": "https://github.com/aalzubidy/pi-signal#readme",
+  "bugs": {
+    "url": "https://github.com/aalzubidy/pi-signal/issues"
+  },
+  "author": "aalzubidy <aalzubidy@protonmail.com>",
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./extensions"],
+    "skills": ["./skills"]
+  },
+  "files": [
+    "extensions",
+    "skills",
+    "scripts",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {},
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "bundledDependencies": [],
+  "scripts": {}
+}
