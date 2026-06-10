@@ -89,6 +89,7 @@ Phone (Note-to-Self) → signal-cli daemon → SSE stream (in-memory)
 | `PI_SIGNAL_PRIMARY` | No | `false` | Set to `"true"` on the ONE instance that should handle Signal messages |
 | `PI_SIGNAL_DAEMON_URL` | No | `http://127.0.0.1:8080` | Daemon URL for JSON-RPC and SSE |
 | `PI_SIGNAL_STATS` | No | `short` | Default stats mode: `off`, `short`, or `full` |
+| `PI_SIGNAL_QUIET_DAEMON` | No | `false` | Set to `"true"` to silence signal-cli daemon stdout (hides message content from `journalctl`). Default `false` — logs visible. |
 
 > **Security note:** Messages are streamed in-memory via SSE directly from the daemon. No log file is written to disk.
 

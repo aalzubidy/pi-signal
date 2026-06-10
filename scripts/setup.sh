@@ -286,6 +286,10 @@ setup_native_mode() {
 #   - SSE listener connects directly from the pi extension via Node.js http module
 #   - No log file is used — messages are streamed in-memory for security
 #   - Daemon restarts only on health check failure
+#
+# Environment variables:
+#   PI_SIGNAL_QUIET_DAEMON — set to "true"/"1"/"yes" to silence daemon stdout
+#     (prevents message content from appearing in journalctl). Default: false.
 
 # Auto-discover account from accounts.json if PI_SIGNAL_ACCOUNT is not set
 if [ -z "$PI_SIGNAL_ACCOUNT" ]; then
@@ -298,6 +302,18 @@ if [ -z "$PI_SIGNAL_ACCOUNT" ]; then
     exit 1
   fi
   echo "Auto-discovered PI_SIGNAL_ACCOUNT=$PI_SIGNAL_ACCOUNT"
+fi
+
+# Determine daemon output redirection
+# When QUIET_DAEMON is true, redirect stdout/stderr to /dev/null so message
+# content doesn't appear in journalctl. Default is false (no redirect,
+# systemd captures stdout naturally into the journal).
+if [ "${PI_SIGNAL_QUIET_DAEMON:-false}" = "true" ] || \
+   [ "${PI_SIGNAL_QUIET_DAEMON:-false}" = "1" ] || \
+   [ "${PI_SIGNAL_QUIET_DAEMON:-false}" = "yes" ]; then
+  DAEMON_REDIRECT=">/dev/null 2>&1"
+else
+  DAEMON_REDIRECT=""
 fi
 
 DAEMON_PID=""
@@ -346,7 +362,7 @@ wait_for_port_free
 
 # Start daemon in single-account mode (-a) — pre-loads account at startup,
 # avoiding NotRegisteredException from multi-account mode SSE.
-signal-cli -a "$PI_SIGNAL_ACCOUNT" daemon --http 127.0.0.1:8080 &
+eval "signal-cli -a \"\$PI_SIGNAL_ACCOUNT\" daemon --http 127.0.0.1:8080 $DAEMON_REDIRECT &"
 DAEMON_PID=$!
 
 echo "Waiting for signal-cli daemon (PID $DAEMON_PID)..."
@@ -380,7 +396,7 @@ while true; do
   if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
     echo "signal-cli daemon died, restarting..."
     wait_for_port_free
-    signal-cli -a "$PI_SIGNAL_ACCOUNT" daemon --http 127.0.0.1:8080 &
+    eval "signal-cli -a \"\$PI_SIGNAL_ACCOUNT\" daemon --http 127.0.0.1:8080 $DAEMON_REDIRECT &"
     DAEMON_PID=$!
     sleep 5
   fi
@@ -391,7 +407,7 @@ while true; do
     kill "$DAEMON_PID" 2>/dev/null
     wait "$DAEMON_PID" 2>/dev/null
     wait_for_port_free
-    signal-cli -a "$PI_SIGNAL_ACCOUNT" daemon --http 127.0.0.1:8080 &
+    eval "signal-cli -a \"\$PI_SIGNAL_ACCOUNT\" daemon --http 127.0.0.1:8080 $DAEMON_REDIRECT &"
     DAEMON_PID=$!
     sleep 5
   fi
@@ -422,6 +438,7 @@ TimeoutStopSec=15
 Environment=HOME=$REAL_HOME
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 Environment=PI_SIGNAL_ACCOUNT=$account
+Environment=PI_SIGNAL_QUIET_DAEMON=false
 
 [Install]
 WantedBy=multi-user.target

@@ -13,6 +13,7 @@ TimeoutStopSec=15
 Environment=HOME=/home/REPLACE_WITH_USERNAME
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 Environment=PI_SIGNAL_ACCOUNT=REPLACE_WITH_PHONE_NUMBER
+Environment=PI_SIGNAL_QUIET_DAEMON=false
 
 [Install]
 WantedBy=multi-user.target

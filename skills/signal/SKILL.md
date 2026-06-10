@@ -101,6 +101,7 @@ pi extension (signal.ts)
 | `PI_SIGNAL_PRIMARY` | No | `false` | Set to `"true"` on the ONE instance that should handle Signal messages |
 | `PI_SIGNAL_DAEMON_URL` | No | `http://127.0.0.1:8080` | Daemon URL for JSON-RPC and SSE |
 | `PI_SIGNAL_STATS` | No | `short` | Default stats mode: `off`, `short`, or `full` |
+| `PI_SIGNAL_QUIET_DAEMON` | No | `false` | Set to `"true"` to silence signal-cli daemon stdout (hides message content from `journalctl`). Default `false` — logs visible. |
 
 > **Note:** The `PI_SIGNAL_INCOMING_LOG` variable has been removed. Messages are now streamed in-memory via SSE for better security.
 
