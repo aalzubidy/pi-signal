@@ -126,8 +126,11 @@ When running multiple pi instances against the same signal-cli, only ONE should 
 │   ├── parseEnvelope() → syncMessage.sentMessage                  │
 │   ├── React 👀 → LLM → auto-reply → swap ✅                      │
 │   └── Send via daemonRpc("send")                                 │
+│       (noteToSelf + notifySelf:false → replies appear grey)     │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+> **Note-to-Self color:** auto-replies use signal-cli's sync-message delivery (`noteToSelf: true`, `notifySelf: false`) so they appear in **grey** (synced from another device) instead of **blue** (outgoing from your own number). The phone must be a separate linked device from the daemon for this to take effect.
 
 ## Security
 

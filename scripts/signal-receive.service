@@ -1,0 +1,18 @@
+[Unit]
+Description=Signal message receiver for pi
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=REPLACE_WITH_USERNAME
+ExecStart=/usr/local/bin/signal-receive-loop.sh
+Restart=always
+RestartSec=15
+TimeoutStopSec=15
+Environment=HOME=/home/REPLACE_WITH_USERNAME
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=PI_SIGNAL_ACCOUNT=REPLACE_WITH_PHONE_NUMBER
+
+[Install]
+WantedBy=multi-user.target
