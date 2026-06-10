@@ -278,16 +278,14 @@ setup_native_mode() {
 
 			cat >"$script_dest" <<'SCRIPT_EOF'
 #!/bin/bash
-# signal-receive-loop.sh — runs signal-cli daemon and streams messages to incoming.log
+# signal-receive-loop.sh — runs signal-cli daemon for in-memory SSE streaming
 # Managed by pi-signal.
 #
 # Architecture (mirrors hermes-agent):
 #   - Daemon runs in single-account mode (-a NUMBER) — account pre-loaded at startup
-#   - SSE listener retries independently with exponential backoff
+#   - SSE listener connects directly from the pi extension via Node.js http module
+#   - No log file is used — messages are streamed in-memory for security
 #   - Daemon restarts only on health check failure
-
-LOG_FILE="$HOME/.local/share/signal-cli/incoming.log"
-mkdir -p "$(dirname "$LOG_FILE")"
 
 # Auto-discover account from accounts.json if PI_SIGNAL_ACCOUNT is not set
 if [ -z "$PI_SIGNAL_ACCOUNT" ]; then
@@ -313,17 +311,6 @@ cleanup() {
   exit 0
 }
 trap cleanup EXIT INT TERM
-
-# Rotate log at ~10 MB to keep it from growing unbounded
-rotate_log() {
-  if [ -f "$LOG_FILE" ]; then
-    SIZE=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
-    if [ "$SIZE" -gt $((10 * 1024 * 1024)) ]; then
-      mv "$LOG_FILE" "$LOG_FILE.$(date +%s)"
-      touch "$LOG_FILE"
-    fi
-  fi
-}
 
 # Wait for port 8080 to be fully released (including kernel TIME_WAIT state).
 # signal-cli's Java HTTP server does not set SO_REUSEADDR, so if a previous
@@ -382,11 +369,14 @@ if [ "$DAEMON_READY" -ne 1 ]; then
   exit 1
 fi
 
-# -- SSE event stream with independent retry (hermes-agent pattern) --
-echo "signal-cli daemon is running, streaming SSE events..."
+# -- Keep daemon alive --
+# The pi extension connects directly to the daemon SSE endpoint over HTTP
+# and streams messages in-memory.  No log file is written.
+# This loop only monitors the daemon process and restarts it if it dies.
+echo "signal-cli daemon is running. pi will connect to SSE endpoint directly."
 
 while true; do
-  # Verify daemon is still alive before trying SSE
+  # Verify daemon is still alive
   if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
     echo "signal-cli daemon died, restarting..."
     wait_for_port_free
@@ -395,22 +385,18 @@ while true; do
     sleep 5
   fi
 
-  rotate_log
+  # Check health endpoint periodically
+  if ! curl -s --max-time 5 http://127.0.0.1:8080/api/v1/check >/dev/null 2>&1; then
+    echo "signal-cli daemon health check failed, restarting..."
+    kill "$DAEMON_PID" 2>/dev/null
+    wait "$DAEMON_PID" 2>/dev/null
+    wait_for_port_free
+    signal-cli -a "$PI_SIGNAL_ACCOUNT" daemon --http 127.0.0.1:8080 &
+    DAEMON_PID=$!
+    sleep 5
+  fi
 
-  # Stream SSE events to log file — curl streams the event stream,
-  # we parse data: lines and append JSON to incoming.log.
-  # When curl exits (connection drop), outer loop retries.
-  curl -s -N "http://127.0.0.1:8080/api/v1/events?account=$PI_SIGNAL_ACCOUNT" 2>/dev/null | while IFS= read -r line; do
-    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
-    [[ "$line" =~ ^[[:space:]]*":" ]] && continue
-    if [[ "$line" =~ ^data:[[:space:]]*(.*) ]]; then
-      data="${BASH_REMATCH[1]}"
-      [ -n "$data" ] && echo "$data" >> "$LOG_FILE"
-    fi
-  done
-
-  # Connection dropped — retry
-  sleep 2
+  sleep 30
 done
 SCRIPT_EOF
 

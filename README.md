@@ -59,7 +59,7 @@ Send a Note-to-Self message from your phone. pi receives it, reacts with 👀, g
 ## How It Works
 
 ```
-Phone (Note-to-Self) → signal-cli daemon → SSE stream → incoming.log
+Phone (Note-to-Self) → signal-cli daemon → SSE stream (in-memory)
     → pi extension → 👀 reaction
       ├── Commands handled locally:
       │   ├── /model <name>    → fuzzy match & switch model
@@ -73,12 +73,13 @@ Phone (Note-to-Self) → signal-cli daemon → SSE stream → incoming.log
 ```
 
 1. You send a Note-to-Self message from your phone
-2. The extension detects it and checks for command prefixes
-3. **Commands** (`/model`, `/abort`, `/clear`, `/stats`) are handled locally without LLM
-4. **Regular messages** are forwarded to the LLM with 👀 reaction
-5. The LLM generates a response
-6. The response is auto-sent to Signal with a **stats footer** appended
-7. The 👀 reaction is swapped to ✅ (or ❌ on failure)
+2. The extension connects directly to the daemon's SSE endpoint over HTTP — **no log file on disk** (more secure)
+3. The extension checks for command prefixes
+4. **Commands** (`/model`, `/abort`, `/clear`, `/stats`) are handled locally without LLM
+5. **Regular messages** are forwarded to the LLM with 👀 reaction
+6. The LLM generates a response
+7. The response is auto-sent to Signal with a **stats footer** appended
+8. The 👀 reaction is swapped to ✅ (or ❌ on failure)
 
 ## Environment Variables
 
@@ -86,9 +87,10 @@ Phone (Note-to-Self) → signal-cli daemon → SSE stream → incoming.log
 |---|---|---|---|
 | `PI_SIGNAL_ACCOUNT` | Yes | — | Your Signal phone number in E.164: `+1234567890` |
 | `PI_SIGNAL_PRIMARY` | No | `false` | Set to `"true"` on the ONE instance that should handle Signal messages |
-| `PI_SIGNAL_DAEMON_URL` | No | `http://127.0.0.1:8080` | Daemon URL for JSON-RPC |
-| `PI_SIGNAL_INCOMING_LOG` | No | `~/.local/share/signal-cli/incoming.log` | Log file path |
+| `PI_SIGNAL_DAEMON_URL` | No | `http://127.0.0.1:8080` | Daemon URL for JSON-RPC and SSE |
 | `PI_SIGNAL_STATS` | No | `short` | Default stats mode: `off`, `short`, or `full` |
+
+> **Security note:** Messages are streamed in-memory via SSE directly from the daemon. No log file is written to disk.
 
 ## Multiple Instances
 
@@ -123,7 +125,7 @@ Send these from your phone as Note-to-Self messages. They are intercepted locall
 | `/signal-setup` | Interactive setup wizard |
 | `/signal-start` | Start systemd service |
 | `/signal-stop` | ⚠️ Stop systemd service (stops Signal message receiving) |
-| `/signal-status` | Show account, service health, stats mode |
+| `/signal-status` | Show account, service health, SSE status, stats mode |
 | `/signal-model <name>` | Switch model by fuzzy-matching partial name |
 | `/signal-abort` | Stop current LLM generation |
 | `/signal-stats [short\|full\|off]` | View or toggle stats mode |
@@ -141,28 +143,30 @@ Send these from your phone as Note-to-Self messages. They are intercepted locall
 ┌─────────────────────────────────────────────────────────────────┐
 │ signal-cli daemon -a +NUMBER --http 127.0.0.1:8080              │
 │   ├── Single-account mode — account pre-loaded at startup       │
-│   ├── SSE: /api/v1/events?account=+NUMBER                       │
+│   ├── SSE: /api/v1/events?account=+NUMBER  (in-memory stream)  │
 │   └── RPC: /api/v1/rpc (JSON-RPC 2.0)                           │
 │                                                                  │
 │ signal-receive-loop.sh (systemd service)                         │
-│   ├── Pipes SSE stream → parse data: lines → incoming.log        │
-│   ├── Waits for port 8080 TIME_WAIT drain before restart         │
-│   └── Daemon restart on health check failure                     │
+│   ├── Manages daemon lifecycle (start / health check / restart) │
+│   ├── Waits for port 8080 TIME_WAIT drain before restart        │
+│   └── Daemon restart on health check failure                    │
 │                                                                  │
 │ pi extension (signal.ts)                                         │
-│   ├── fs.watch on incoming.log                                   │
+│   ├── SSE HTTP stream (in-memory, no log file)                   │
 │   ├── parseEnvelope() → syncMessage.sentMessage                  │
+│   ├── Auto-reconnect with exponential backoff (2s–60s)          │
 │   ├── React 👀 → LLM → auto-reply → swap ✅                      │
 │   └── Send via daemonRpc("send")                                 │
-│       (noteToSelf + notifySelf:false → replies appear grey)     │
+│       (recipient-based sync → replies appear grey)              │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-> **Note-to-Self color:** auto-replies use signal-cli's sync-message delivery (`noteToSelf: true`, `notifySelf: false`) so they appear in **grey** (synced from another device) instead of **blue** (outgoing from your own number). The phone must be a separate linked device from the daemon for this to take effect.
+> **Note-to-Self color:** auto-replies use signal-cli's sync-message delivery (sending to self with the resolved UUID) so they appear in **grey** (synced from another device) instead of **blue** (outgoing from your own number). The phone must be a separate linked device from the daemon for this to take effect.
 
 ## Security
 
-Only messages from `PI_SIGNAL_ACCOUNT` (your own number) are processed — i.e. Note-to-Self messages only. Messages from other senders are silently dropped.
+- **No log file on disk** — messages are streamed in-memory via SSE. No message content is persisted outside of pi's runtime memory.
+- Only messages from `PI_SIGNAL_ACCOUNT` (your own number) are processed — i.e. Note-to-Self messages only. Messages from other senders are silently dropped.
 
 ## Troubleshooting
 

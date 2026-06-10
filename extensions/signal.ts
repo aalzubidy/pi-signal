@@ -4,22 +4,16 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import * as fs from "node:fs";
-import * as path from "node:path";
-import * as os from "node:os";
+import * as http from "node:http";
 
 // ── Configuration ─────────────────────────────────────────────────────
 
 const PI_SIGNAL_ACCOUNT = process.env.PI_SIGNAL_ACCOUNT || "";
 
-// The daemon locks the config file, blocking all CLI commands.
-// Use the daemon's JSON-RPC API instead.
+// The daemon exposes a JSON-RPC API for sends and an SSE endpoint for receives.
+// Uses in-memory SSE streaming — no log file on disk (more secure).
 const SIGNAL_DAEMON_URL =
 	process.env.PI_SIGNAL_DAEMON_URL || "http://127.0.0.1:8080";
-
-const PI_SIGNAL_INCOMING_LOG =
-	process.env.PI_SIGNAL_INCOMING_LOG ||
-	path.join(os.homedir(), ".local", "share", "signal-cli", "incoming.log");
 
 // When running multiple pi instances, only the primary instance should
 // process Signal messages. Set PI_SIGNAL_PRIMARY=true on the instance
@@ -34,12 +28,18 @@ const DEFAULT_STATS_MODE = (
 	process.env.PI_SIGNAL_STATS || "short"
 ).toLowerCase();
 
+// SSE reconnect backoff parameters (mirrors hermes-agent)
+const SSE_RETRY_DELAY_INITIAL = 2000; // ms
+const SSE_RETRY_DELAY_MAX = 60_000; // ms
+
 // ── Extension ──────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-	// Native-mode state
-	let fileWatcher: fs.FSWatcher | null = null;
-	let lastPosition = 0;
+	// SSE stream state
+	let sseRequest: http.ClientRequest | null = null;
+	let sseReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	let sseReconnectDelay = SSE_RETRY_DELAY_INITIAL;
+	let sseConnected = false;
 
 	// Resolved Signal UUID (ACI) for our own account — resolves from
 	// phone number to UUID at startup via listContacts RPC. Using the
@@ -72,22 +72,6 @@ export default function (pi: ExtensionAPI) {
 		DEFAULT_STATS_MODE === "full" ? "full"
 		: DEFAULT_STATS_MODE === "off" ? "off"
 		: "short";
-
-	// ── Helpers ──────────────────────────────────────────────────────
-
-	function getLogPath(): string {
-		return PI_SIGNAL_INCOMING_LOG;
-	}
-
-	async function ensureLogfile(): Promise<string> {
-		const logPath = getLogPath();
-		const dir = path.dirname(logPath);
-		fs.mkdirSync(dir, { recursive: true });
-		if (!fs.existsSync(logPath)) {
-			fs.writeFileSync(logPath, "");
-		}
-		return logPath;
-	}
 
 	/**
 	 * Parse a single JSON line from the signal-cli daemon SSE stream.
@@ -693,69 +677,140 @@ export default function (pi: ExtensionAPI) {
 		return res.ok;
 	}
 
-	// ── Native mode: file watcher ─────────────────────────────────────
+	// ── SSE Listener (in-memory, no log file) ─────────────────────────
 
-	async function startNativeMode(_ctx: unknown): Promise<void> {
+	/**
+	 * Connect to the signal-cli daemon's SSE endpoint and stream incoming
+	 * messages in-memory.  Reconnects automatically with exponential backoff
+	 * on connection drops — mirrors hermes-agent's _sse_listener pattern.
+	 *
+	 * No log file is written — all message processing happens in-memory
+	 * for better security.
+	 */
+	function startSSEListener(): void {
 		// Skip if not the primary instance
 		if (!PI_SIGNAL_PRIMARY) {
 			console.log(
-				"[signal] PI_SIGNAL_PRIMARY is not set — skipping Signal listener (another instance handles it).",
+				"[signal] PI_SIGNAL_PRIMARY is not set — skipping SSE listener (another instance handles it).",
 			);
 			return;
 		}
 
-		// Resolve our phone number to a Signal UUID so outgoing messages
-		// use the recipient-based sync path (grey bubbles instead of blue).
-		resolvedAccountId = await resolveAccountId();
-
-		const logPath = await ensureLogfile();
-
-		try {
-			lastPosition = fs.statSync(logPath).size;
-		} catch {
-			lastPosition = 0;
+		if (!PI_SIGNAL_ACCOUNT) {
+			console.warn("[signal] PI_SIGNAL_ACCOUNT is not set — cannot start SSE listener.");
+			return;
 		}
 
-		const onWatchEvent = async () => {
-			try {
-				if (!fs.existsSync(logPath)) return;
-				const content = fs.readFileSync(logPath, "utf8");
-				if (content.length <= lastPosition) {
-					lastPosition = 0;
+		doConnect();
+	}
+
+	function doConnect() {
+		// Clean up any existing connection
+		cleanupSSE();
+
+		const daemonUrl = new URL(SIGNAL_DAEMON_URL);
+		const ssePath = `/api/v1/events?account=${encodeURIComponent(PI_SIGNAL_ACCOUNT)}`;
+
+		console.log(`[signal] connecting SSE to ${SIGNAL_DAEMON_URL}${ssePath}`);
+
+		const req = http.get(
+			{
+				hostname: daemonUrl.hostname,
+				port: daemonUrl.port || 8080,
+				path: ssePath,
+				timeout: 0, // no timeout — stream stays open
+			},
+			(res) => {
+				const statusCode = res.statusCode || 0;
+
+				if (statusCode !== 200) {
+					console.error(`[signal] SSE connection failed with status ${statusCode}`);
+					res.resume(); // drain the response
+					scheduleReconnect();
+					return;
 				}
-				const newContent = content.slice(lastPosition);
-				lastPosition = content.length;
-				if (!newContent.trim()) return;
 
-				for (const line of newContent.split("\n")) {
-					if (!line.trim()) continue;
-					const parsed = parseEnvelope(line);
-					if (parsed) injectMessage(parsed);
-				}
-			} catch (err) {
-				console.error("[signal] processNewLines error:", err);
-			}
-		};
+				console.log("[signal] SSE connected — listening for incoming messages");
+				sseConnected = true;
+				sseReconnectDelay = SSE_RETRY_DELAY_INITIAL; // reset backoff
 
-		try {
-			fileWatcher = fs.watch(logPath, onWatchEvent);
-		} catch (err) {
-			console.error("[signal] failed to create watcher:", err);
+				let buffer = "";
+
+				res.on("data", (chunk: Buffer) => {
+					buffer += chunk.toString("utf8");
+
+					// Process complete lines from the buffer
+					const lines = buffer.split("\n");
+					buffer = lines.pop() || ""; // keep incomplete line in buffer
+
+					for (const line of lines) {
+						const trimmed = line.trim();
+						if (!trimmed) continue;
+						if (trimmed.startsWith(":")) continue; // SSE comment
+
+						// Parse SSE "data:" prefix
+						if (trimmed.startsWith("data:")) {
+							const data = trimmed.slice(5).trim();
+							if (!data) continue;
+
+							const parsed = parseEnvelope(data);
+							if (parsed) injectMessage(parsed);
+						}
+					}
+				});
+
+				res.on("end", () => {
+					console.log("[signal] SSE stream ended");
+					sseConnected = false;
+					scheduleReconnect();
+				});
+
+				res.on("error", (err) => {
+					console.error("[signal] SSE stream error:", err.message);
+					sseConnected = false;
+					scheduleReconnect();
+				});
+			},
+		);
+
+		req.on("error", (err) => {
+			console.error(`[signal] SSE connection error: ${err.message}`);
+			sseConnected = false;
+			scheduleReconnect();
+		});
+
+		req.setTimeout(0); // no timeout
+
+		sseRequest = req;
+	}
+
+	function scheduleReconnect() {
+		if (sseReconnectTimer) return; // already scheduled
+
+		const delay = sseReconnectDelay;
+		console.log(`[signal] reconnecting SSE in ${delay}ms`);
+
+		sseReconnectTimer = setTimeout(() => {
+			sseReconnectTimer = null;
+			// Exponential backoff, capped at max
+			sseReconnectDelay = Math.min(
+				sseReconnectDelay * 2,
+				SSE_RETRY_DELAY_MAX,
+			);
+			doConnect();
+		}, delay);
+	}
+
+	function cleanupSSE() {
+		if (sseReconnectTimer) {
+			clearTimeout(sseReconnectTimer);
+			sseReconnectTimer = null;
 		}
-
-		// Notify if the systemd service is not running
-		const result = await pi.exec("systemctl", [
-			"is-active",
-			"signal-receive.service",
-		]);
-		if (result.code !== 0) {
-			if (_ctx && typeof _ctx === "object" && "ui" in _ctx) {
-				(_ctx as Record<string, unknown>).ui?.notify?.(
-					"signal-receive.service is not running. Run /signal-start to start it, or see /signal-setup.",
-					"warning",
-				);
-			}
+		if (sseRequest) {
+			sseRequest.destroy();
+			sseRequest = null;
 		}
+		sseConnected = false;
 	}
 
 	// ── Account ID resolution ──────────────────────────────────────
@@ -861,7 +916,27 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event: unknown, ctx: unknown) => {
 		// Store context for command handlers
 		extCtx = ctx as ExtensionContext | null;
-		await startNativeMode(ctx);
+
+		// Resolve our phone number to a Signal UUID so outgoing messages
+		// use the recipient-based sync path (grey bubbles instead of blue).
+		resolvedAccountId = await resolveAccountId();
+
+		// Start the SSE listener for incoming messages (in-memory)
+		startSSEListener();
+
+		// Notify if the systemd service is not running
+		const result = await pi.exec("systemctl", [
+			"is-active",
+			"signal-receive.service",
+		]);
+		if (result.code !== 0) {
+			if (ctx && typeof ctx === "object" && "ui" in ctx) {
+				(ctx as Record<string, unknown>).ui?.notify?.(
+					"signal-receive.service is not running. Run /signal-start to start it, or see /signal-setup.",
+					"warning",
+				);
+			}
+		}
 	});
 
 	// Auto-send agent responses back to Signal, with stats footer
@@ -951,10 +1026,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
-		if (fileWatcher) {
-			fileWatcher.close();
-			fileWatcher = null;
-		}
+		cleanupSSE();
 	});
 
 	// ── Tool: signal_send ──────────────────────────────────────────
@@ -1039,7 +1111,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Signal Status",
 		description:
 			"Check whether signal-cli is installed, the daemon is running, " +
-			"and the incoming-message log file is being written.",
+			"and the SSE stream is connected.",
 		parameters: Type.Object({}),
 		async execute(
 			_toolCallId: string,
@@ -1064,14 +1136,8 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
-			// Check incoming log
-			const logPath = getLogPath();
-			if (fs.existsSync(logPath)) {
-				const stats = fs.statSync(logPath);
-				lines.push(`incoming.log: ${stats.size} bytes (${logPath})`);
-			} else {
-				lines.push(`incoming.log: not found at ${logPath}`);
-			}
+			// Check SSE stream status (in-memory, no log file)
+			lines.push(`SSE stream: ${sseConnected ? "✓ connected" : "✗ disconnected"}`);
 
 			// Add stats mode info
 			lines.push(`Stats mode: ${statsMode}`);
@@ -1252,11 +1318,7 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
-			const logExists = fs.existsSync(getLogPath());
-			const logSize = logExists ? fs.statSync(getLogPath()).size : 0;
-			statusLines.push(
-				`incoming.log: ${logExists ? `${logSize} bytes` : "not found"}`,
-			);
+			statusLines.push(`SSE stream: ${sseConnected ? "✓ connected" : "✗ disconnected"}`);
 
 			statusLines.push(`Stats mode: ${statsMode}`);
 
