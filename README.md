@@ -6,23 +6,19 @@ Connect [pi](https://pi.dev) to [Signal Messenger](https://signal.org/) for two-
 
 ## Installation
 
-```bash
-pi install npm:@aalzubidy/pi-signal
-```
-
-## Quick Start
-
-**Prerequisites:** [signal-cli](https://github.com/AsamK/signal-cli/) in PATH, Signal app on your phone.
+**Prerequisites:** [signal-cli](https://github.com/AsamK/signal-cli/) in PATH, Java 25+, Signal app on your phone.
 
 ```bash
-# 1. Run the setup wizard - it might need sudo because it creates the systemd file
-bash scripts/setup.sh        #  Guide you to setup signal-cli, links device, creates systemd service
+# 1. Clone the repo and run the setup wizard
+git clone https://github.com/aalzubidy/pi-signal.git
+cd pi-signal
+bash scripts/setup.sh                  # guides you through Java check, device linking, systemd service
 
-# 2. Set your phone number
+# 2. Set your phone number (setup.sh may have auto-configured this)
 export PI_SIGNAL_ACCOUNT=+1234567890   # or add to ~/.bashrc
 
-# 3. Install and restart pi
-pi install npm:@aalzubidy/pi-signal
+# 3. Install the pi package locally
+pi install ./pi-signal
 
 # 4. Ensure one instance of pi is the primary - DO NOT SET IT ON PROFILE LEVEL
 # Then restart pi or run /reload

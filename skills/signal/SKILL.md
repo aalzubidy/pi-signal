@@ -16,10 +16,12 @@ Two-way messaging between pi and Signal via signal-cli daemon with in-memory SSE
 - systemd (Linux)
 - Signal app on your phone
 
-## Step 1 — Run the setup wizard
+## Installation
 
 ```bash
-cd /path/to/pi-signal
+# 1. Clone the repo and run the setup wizard
+git clone https://github.com/aalzubidy/pi-signal.git
+cd pi-signal
 bash scripts/setup.sh
 ```
 
