@@ -11,7 +11,7 @@
   "bugs": {
     "url": "https://github.com/aalzubidy/pi-signal/issues"
   },
-  "author": "aalzubidy",
+  "author": "aasystemsllc-aalzubidy",
   "license": "MPL-2.0",
   "pi": {
     "extensions": ["./extensions"],
