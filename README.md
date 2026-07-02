@@ -45,6 +45,11 @@ The extension connects directly to the signal-cli daemon's SSE endpoint over HTT
 
 Commands (`/model`, `/abort`, `/clear`, `/stats`, `/ping`, `/help`) are handled locally without LLM. Everything else is forwarded to the LLM.
 
+![Note-to-Self message](docs/img/note-to-self-img.png)
+
+![pi agent response](docs/img/pi-agent-response-img.png)
+
+
 ## Environment Variables
 
 | Variable | Required | Default | Description |
