@@ -18,21 +18,34 @@ Two-way messaging between pi and Signal via signal-cli daemon with in-memory SSE
 
 ## Installation
 
+Installing the pi package (via npm) and provisioning the system daemon (via `setup.sh`) are two
+separate steps — the package ships `scripts/setup.sh` inside it, so no `git clone` is needed.
+
 ```bash
-# 1. Clone the repo and run the setup wizard
-git clone https://github.com/aalzubidy/pi-signal.git
-cd pi-signal
-bash scripts/setup.sh
+# 1. Install the pi package
+pi install @aalzubidy/pi-signal
 ```
 
-This will:
+Restart pi or run `/reload`.
+
+## Step 2 — Run the setup wizard
+
+```
+/signal-setup
+```
+
+This checks Java 25+ and signal-cli, then prints the exact `bash <installed-path>/scripts/setup.sh`
+command to run. pi's command can't run it for you — the script needs a sudo password prompt and a
+blocking phone QR scan, and `pi.exec` runs commands without a terminal attached.
+
+Run the printed command in a real terminal. It will:
 1. Check Java 25+ and signal-cli
 2. Link your Signal device (`signal-cli -a NUMBER link -n pi`)
 3. Fix file ownership (handles sudo correctly)
 4. Create a systemd service (`/etc/systemd/system/signal-receive.service`)
 5. Start the service and verify the daemon is ready
 
-## Step 2 — Set environment variables
+## Step 3 — Set environment variables
 
 Add to your shell config (`~/.profile`, `~/.zshrc`, etc.):
 
@@ -41,14 +54,6 @@ export PI_SIGNAL_ACCOUNT=+1234567890   # your phone number with +
 ```
 
 Then reload: `source ~/.profile`
-
-## Step 3 — Install the pi package
-
-```bash
-pi install /path/to/pi-signal
-```
-
-Restart pi or run `/reload`.
 
 ## Step 4 — Test it
 
