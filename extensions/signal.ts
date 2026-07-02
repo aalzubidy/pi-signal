@@ -5,8 +5,17 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import * as http from "node:http";
+import * as path from "node:path";
 
 // ── Configuration ─────────────────────────────────────────────────────
+
+// Absolute path to the installed package root (parent of extensions/), so
+// commands can point at scripts/setup.sh regardless of where pi installed
+// this package (npm registry install, local dev checkout, etc). `pi` runs
+// extensions through jiti, which supports CommonJS-style `__dirname` even
+// though this file is authored as an ES module.
+const PACKAGE_ROOT = path.resolve(__dirname, "..");
+const SETUP_SCRIPT_PATH = path.join(PACKAGE_ROOT, "scripts", "setup.sh");
 
 const PI_SIGNAL_ACCOUNT = process.env.PI_SIGNAL_ACCOUNT || "";
 
@@ -117,13 +126,27 @@ export default function (pi: ExtensionAPI) {
 		// Check for syncMessage (Note to Self / messages synced from other devices)
 		if (!body && env.syncMessage && typeof env.syncMessage === "object") {
 			const sm = env.syncMessage as Record<string, unknown>;
-			// Note to Self: body is in syncMessage.sentMessage.message
+			// Note to Self: body is in syncMessage.sentMessage.message, AND the
+			// message was addressed to our own account (destination === account).
+			// signal-cli emits syncMessage.sentMessage for EVERY message this
+			// account sends from any linked device — to anyone — so the presence
+			// of a sentMessage body is NOT enough; we must confirm the recipient
+			// is ourselves, otherwise messages you send to other people would be
+			// treated as Note-to-Self and forwarded to the agent.
 			if (sm.sentMessage && typeof sm.sentMessage === "object") {
 				const sentMsg = sm.sentMessage as Record<string, unknown>;
+				const destination =
+					(sentMsg.destinationNumber as string | undefined) ||
+					(sentMsg.destination as string | undefined);
 				body =
 					(sentMsg.message as string | undefined) ||
 					(sentMsg.body as string | undefined);
-				if (body) isNoteToSelf = true;
+				if (body && PI_SIGNAL_ACCOUNT && destination === PI_SIGNAL_ACCOUNT) {
+					isNoteToSelf = true;
+				} else if (body) {
+					// A synced message to someone else — ignore it entirely.
+					return null;
+				}
 			}
 			// Fallback: direct body on syncMessage (some sync events)
 			if (!body) {
@@ -574,11 +597,9 @@ export default function (pi: ExtensionAPI) {
 		body: string;
 		timestamp: number;
 	}) {
-		// Only process Note-to-Self messages (from own account)
+		// Only process Note-to-Self messages (from own account). Silently drop
+		// anything else — no log; these are just other people's messages.
 		if (parsed.number !== PI_SIGNAL_ACCOUNT) {
-			console.log(
-				`[signal] ignoring message from ${parsed.number} (not PI_SIGNAL_ACCOUNT)`,
-			);
 			return;
 		}
 
@@ -1241,7 +1262,7 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			extensionCtx.ui?.notify?.("Starting Signal setup wizard…", "info");
-			await setupNativeMode(extensionCtx);
+			await setupNativeMode(extensionCtx.ui);
 		},
 	});
 
@@ -1338,6 +1359,13 @@ export default function (pi: ExtensionAPI) {
 		notify?: (msg: string, level: string) => void;
 		confirm?: (title: string, msg: string) => Promise<boolean>;
 	}): Promise<void> {
+		// pi's extension `exec` runs commands with stdin ignored (no TTY), so
+		// this command cannot itself run setup.sh — it needs a sudo password
+		// prompt and a blocking QR-link step. Instead, run pre-flight checks
+		// here and hand the user the exact command to run in a real terminal,
+		// resolved to wherever this package is actually installed (no need to
+		// clone the repo separately).
+
 		// Step 1: Check Java 25+
 		const javaCheck = await pi.exec("java", ["-version"], { timeout: 5_000 });
 		if (javaCheck.code !== 0) {
@@ -1345,20 +1373,15 @@ export default function (pi: ExtensionAPI) {
 				"Java 25+ is required. Install it: https://adoptium.net/",
 				"error",
 			);
-			return;
+		} else {
+			ctx.notify?.("✓ Java is installed", "info");
 		}
-		ctx.notify?.("✓ Java is installed", "info");
 
 		// Step 2: Check signal-cli
 		const cliCheck = await pi.exec("which", ["signal-cli"], { timeout: 5_000 });
 		if (cliCheck.code !== 0) {
 			ctx.notify?.(
-				"signal-cli not found. It will be downloaded from GitHub releases.\n" +
-					"  See: https://github.com/AsamK/signal-cli/wiki/Quickstart",
-				"info",
-			);
-			ctx.notify?.(
-				"Run:  bash scripts/setup.sh  to download signal-cli and create the systemd service.",
+				"signal-cli not found — setup.sh will guide you through installing it.",
 				"info",
 			);
 		} else {
@@ -1368,37 +1391,24 @@ export default function (pi: ExtensionAPI) {
 			);
 		}
 
-		// Step 3: Link device
-		const linked = await ctx.confirm?.(
-			"Link Signal device?",
-			"Does your Signal account already have this pi instance linked? (If not, we can generate a linking URI.)",
-		);
-		if (!linked) {
-			ctx.notify?.(
-				"Run:  signal-cli -a +YOUR_NUMBER link -n pi\n" +
-					"Then open the sgnl:// URI on your phone and confirm.",
-				"info",
-			);
-		}
-
-		// Step 4: Set up systemd service
+		// Step 3: Check systemd service status (informational only)
 		const svcStatus = await pi.exec(
 			"systemctl",
 			["is-active", "signal-receive.service"],
-			{
-				timeout: 5_000,
-			},
+			{ timeout: 5_000 },
 		);
-		if (svcStatus.code !== 0) {
-			ctx.notify?.(
-				"The signal-receive service is not running.\n" +
-					"  Run:  bash scripts/setup.sh  to create and start the systemd service.",
-				"warning",
-			);
-		} else {
+		if (svcStatus.code === 0) {
 			ctx.notify?.("✓ signal-receive.service is already running", "info");
+		} else {
+			ctx.notify?.("signal-receive.service is not set up yet.", "info");
 		}
 
-		ctx.notify?.("✓ Setup complete!", "info");
+		// Step 4: Hand off to the deterministic installer. This needs a real
+		// terminal (sudo password, interactive QR link) that pi cannot provide.
+		ctx.notify?.(
+			`Run this in a terminal to finish setup (link device + create service):\n\n` +
+				`  bash ${SETUP_SCRIPT_PATH}\n`,
+			"info",
+		);
 	}
 }

@@ -8,21 +8,28 @@ Connect [pi](https://pi.dev) to [Signal Messenger](https://signal.org/) for two-
 
 **Prerequisites:** [signal-cli](https://github.com/AsamK/signal-cli/) in PATH, Java 25+, Signal app on your phone.
 
+Installation has two separate layers — install the pi package from npm, then provision the
+system daemon that receives Signal messages:
+
 ```bash
-# 1. Clone the repo and run the setup wizard
-git clone https://github.com/aalzubidy/pi-signal.git
-cd pi-signal
-bash scripts/setup.sh                  # guides you through Java check, device linking, systemd service
+# 1. Install the pi package (no clone needed)
+pi install @aalzubidy/pi-signal
 
-# 2. Set your phone number (setup.sh may have auto-configured this)
-export PI_SIGNAL_ACCOUNT=+1234567890   # or add to ~/.bashrc
+# 2. In pi, run the setup wizard command. It checks Java/signal-cli, then prints the
+#    exact `bash .../setup.sh` command to run in a terminal (needs sudo + a phone QR
+#    scan, which pi's command can't do for you — it just locates the script for you).
+/signal-setup
 
-# 3. Install the pi package locally
-pi install ./pi-signal
+# 3. Run the command it prints, in a terminal:
+bash /path/it/printed/scripts/setup.sh   # guides you through device linking, systemd service - **you might need to run it as sudo since it creates systemd service file**
 
-# 4. Ensure one instance of pi is the primary - DO NOT SET IT ON PROFILE LEVEL
-# Then restart pi or run /reload
-export PI_SIGNAL_PRIMARY=true && pi
+# 4. setup.sh prints these two exports at the end — add them to your shell
+#    config (~/.bashrc, ~/.zshrc, ~/.profile), then restart your shell:
+export PI_SIGNAL_ACCOUNT=+1234567890   # your Signal number (E.164)
+export PI_SIGNAL_PRIMARY=true          # marks this instance as the one handling Signal
+
+# 5. Start pi (restart it or run /reload if already running)
+pi
 ```
 
 Send a Note-to-Self from your phone. pi receives it (👀), processes it, and replies automatically (✅).
