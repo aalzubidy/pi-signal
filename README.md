@@ -4,6 +4,27 @@ Connect [pi](https://pi.dev) to [Signal Messenger](https://signal.org/) for two-
 
 > **Only Note-to-Self messages are processed.** Messages from other senders are silently ignored for security.
 
+## How It Works
+
+```
+Phone (Note-to-Self) → signal-cli daemon (SSE in-memory) → pi extension
+    → 👀 reaction → LLM processes → auto-reply → ✅ reaction
+```
+
+The extension connects directly to the signal-cli daemon's SSE endpoint over HTTP — **no log file on disk** (messages are streamed in-memory).
+
+Commands (`/model`, `/abort`, `/clear`, `/stats`, `/status`, `/whoami`, `/resend`, `/pause`, `/resume`, `/help`) are handled locally without LLM. Everything else is forwarded to the LLM.
+
+![Note-to-Self message](docs/img/note-to-self-img.png)
+
+![pi agent response](docs/img/pi-agent-response-img.png)
+
+You can also send the response to someone else in your contacts using their name or phone number.
+
+![Note-to-Self-Send-to message](docs/img/note-to-self-send-to-img.png)
+
+![pi agent response](docs/img/pi-agent-response-send-to-img.png)
+
 ## Installation
 
 **Prerequisites:** [signal-cli](https://github.com/AsamK/signal-cli/) in PATH, Java 25+, Signal app on your phone.
@@ -34,21 +55,6 @@ pi
 
 Send a Note-to-Self from your phone. pi receives it (👀), processes it, and replies automatically (✅).
 
-## How It Works
-
-```
-Phone (Note-to-Self) → signal-cli daemon (SSE in-memory) → pi extension
-    → 👀 reaction → LLM processes → auto-reply → ✅ reaction
-```
-
-The extension connects directly to the signal-cli daemon's SSE endpoint over HTTP — **no log file on disk** (messages are streamed in-memory).
-
-Commands (`/model`, `/abort`, `/clear`, `/stats`, `/ping`, `/help`) are handled locally without LLM. Everything else is forwarded to the LLM.
-
-![Note-to-Self message](docs/img/note-to-self-img.png)
-
-![pi agent response](docs/img/pi-agent-response-img.png)
-
 
 ## Environment Variables
 
@@ -68,17 +74,24 @@ Commands (`/model`, `/abort`, `/clear`, `/stats`, `/ping`, `/help`) are handled 
 | `/abort` | Stop current generation |
 | `/clear` | New session |
 | `/stats [short\|full\|off]` | Toggle usage stats |
-| `/ping` | Test connectivity |
+| `/status` | Live connection & model info (in-memory, never hangs — only answers when pi is up) |
+| `/whoami` | Show model, working directory, and session |
+| `/resend` | Re-send the last reply (recover a dropped message) |
+| `/pause` | Stop processing incoming messages (commands still work) |
+| `/resume` | Resume processing |
 | `/help` | Show available commands |
+
+> **Send to another number:** just ask the LLM naturally — e.g. *"summarize this and text it to +1555…"*, or by name: *"send this to Mike"*. For a name, the agent resolves it via `signal_list_contacts` first (names only resolve if signal-cli knows them — a synced contact or Signal profile name). The message goes to that number, and the agent's confirmation reply comes back to your Note-to-Self so you can see who it was sent to.
 
 ## TUI Commands (in pi)
 
-`/signal-setup`, `/signal-start`, `/signal-stop`, `/signal-status`, `/signal-model`, `/signal-abort`, `/signal-stats`
+`/signal-setup`, `/signal-start`, `/signal-stop`, `/signal-restart`, `/signal-status`, `/signal-logs [n]`, `/signal-send <+E164> <msg>`, `/signal-model`, `/signal-abort`, `/signal-stats`
 
 ## Tools (LLM-accessible)
 
 - **`signal_send`** — Send a Signal message to a phone number (E.164)
 - **`signal_status`** — Check connection status and health
+- **`signal_list_contacts`** — List contacts (name → number) so the agent can resolve a name before sending
 
 ## Multiple Instances
 
