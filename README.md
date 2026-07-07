@@ -64,7 +64,7 @@ Send a Note-to-Self from your phone. pi receives it (👀), processes it, and re
 | `PI_SIGNAL_PRIMARY` | No | `false` | Set `"true"` on the ONE instance handling Signal messages |
 | `PI_SIGNAL_DAEMON_URL` | No | `http://127.0.0.1:8080` | Daemon URL for JSON-RPC and SSE |
 | `PI_SIGNAL_STATS` | No | `short` | Stats mode: `off`, `short`, or `full` |
-| `PI_SIGNAL_QUIET_DAEMON` | No | `false` | Silence daemon stdout in journalctl |
+| `PI_SIGNAL_QUIET_DAEMON` | No | `true` | Keep message content out of journalctl (secure default). Set `"false"` to surface daemon output for debugging |
 
 ## Commands (from Signal)
 
@@ -96,6 +96,13 @@ Send a Note-to-Self from your phone. pi receives it (👀), processes it, and re
 ## Multiple Instances
 
 Set `PI_SIGNAL_PRIMARY=true` on one pi instance. Other instances ignore Signal messages.
+
+## Security
+
+- Only **Note-to-Self** messages drive the agent; messages from other senders are ignored.
+- Message content is streamed in-memory (no log file), and by default (`PI_SIGNAL_QUIET_DAEMON=true`) daemon output is kept out of `journalctl`.
+- Third-party contact names from `signal_list_contacts` are sanitized before reaching the agent.
+- The signal-cli daemon on `127.0.0.1:8080` is **unauthenticated** (a signal-cli limitation). It is bound to loopback, but any local process can reach it — so run pi-signal only on a **single-trusted-user host** and don't expose port 8080. See [SKILL.md](skills/signal/SKILL.md#security-model) for details.
 
 ## Troubleshooting
 

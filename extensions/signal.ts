@@ -257,6 +257,22 @@ export default function (pi: ExtensionAPI) {
 		return String(n);
 	}
 
+	/**
+	 * Neutralize an untrusted contact display name before it enters the agent's
+	 * context. Contact names/usernames come from third parties' Signal profiles,
+	 * so a malicious contact could embed newlines + instructions to prompt-inject
+	 * the agent when the user asks to "send this to <name>". Collapse control
+	 * characters, newlines, bidi and zero-width marks to plain spaces, then cap
+	 * the length. Ordinary names pass through unchanged.
+	 */
+	function sanitizeContactName(s: string): string {
+		return s
+			.replace(/[\u0000-\u001F\u007F\u200B-\u200F\u2028\u2029]+/g, " ")
+			.replace(/\s+/g, " ")
+			.trim()
+			.slice(0, 100);
+	}
+
 	/** Simple Levenshtein distance between two strings. */
 	function levenshtein(a: string, b: string): number {
 		const m = a.length;
@@ -1341,7 +1357,9 @@ export default function (pi: ExtensionAPI) {
 							.trim() ||
 						(c.username as string) ||
 						"";
-					return { name, number };
+					// Names/usernames are third-party controlled — sanitize before
+					// they reach the agent's context (prompt-injection defense).
+					return { name: sanitizeContactName(name), number };
 				})
 				// Drop numberless contacts (can't be sent via signal_send) and self.
 				.filter((c) => c.number && c.number !== PI_SIGNAL_ACCOUNT);

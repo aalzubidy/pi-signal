@@ -99,7 +99,11 @@ pi extension (signal.ts)
 
 **Key architectural decision:** The daemon runs in **single-account mode** (`-a NUMBER`). This pre-loads the account at startup, avoiding `NotRegisteredException` that occurs in multi-account mode when the SSE endpoint tries to lazily load the account manager.
 
-**Security:** Messages are streamed in-memory via SSE — no message content is written to a log file on disk.
+## Security model
+
+- **In-memory streaming.** Messages are streamed in-memory via SSE — no message content is written to a log file on disk. By default (`PI_SIGNAL_QUIET_DAEMON=true`) the signal-cli daemon's stdout is also discarded, so message bodies do **not** land in `journalctl`. Set `PI_SIGNAL_QUIET_DAEMON=false` only when debugging (this surfaces daemon output, including message content, in the journal).
+- **Contact names are treated as untrusted.** Display names and usernames returned by `signal_list_contacts` come from third-party Signal profiles, so they are sanitized (control characters, newlines, and zero-width/bidi marks stripped; length capped) before reaching the agent, to blunt prompt-injection via a crafted profile name.
+- **The local daemon is unauthenticated — trust boundary.** signal-cli's `daemon --http` exposes JSON-RPC and SSE on `127.0.0.1:8080` with **no authentication token** (a signal-cli limitation, not configurable here). It is bound to loopback, so it is not reachable over the network — but **any local user or process on the host** can reach it. Such a process could send Signal messages as your account, read incoming message content and your contact list, or drive the pi agent by injecting a Note-to-Self. **Run pi-signal only on a single-trusted-user host.** Do not expose port 8080 beyond loopback.
 
 ---
 
@@ -111,7 +115,7 @@ pi extension (signal.ts)
 | `PI_SIGNAL_PRIMARY` | No | `false` | Set to `"true"` on the ONE instance that should handle Signal messages |
 | `PI_SIGNAL_DAEMON_URL` | No | `http://127.0.0.1:8080` | Daemon URL for JSON-RPC and SSE |
 | `PI_SIGNAL_STATS` | No | `short` | Default stats mode: `off`, `short`, or `full` |
-| `PI_SIGNAL_QUIET_DAEMON` | No | `false` | Set to `"true"` to silence signal-cli daemon stdout (hides message content from `journalctl`). Default `false` — logs visible. |
+| `PI_SIGNAL_QUIET_DAEMON` | No | `true` | Silence signal-cli daemon stdout so message content stays out of `journalctl` (the secure default). Set to `"false"` to surface daemon output in the journal for debugging. |
 
 > **Note:** The `PI_SIGNAL_INCOMING_LOG` variable has been removed. Messages are now streamed in-memory via SSE for better security.
 
