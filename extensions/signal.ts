@@ -83,6 +83,15 @@ export default function (pi: ExtensionAPI) {
 		: "short";
 
 	/**
+	 * When true, normal messages from Signal are NOT forwarded to the agent.
+	 * Toggled via /pause and /resume. Commands (including /resume) still work.
+	 */
+	let paused = false;
+
+	/** The last agent reply text sent back to Signal, for /resend. */
+	let lastAgentReply: string | null = null;
+
+	/**
 	 * Parse a single JSON line from the signal-cli daemon SSE stream.
 	 * Format: { envelope: { source, sourceName, dataMessage, syncMessage } }
 	 */
@@ -372,8 +381,16 @@ export default function (pi: ExtensionAPI) {
 				return handleClearCommand(ctx, parsed, reply);
 			case "stats":
 				return handleStatsCommand(parsed, args, reply);
-			case "ping":
-				return handlePingCommand(parsed, reply);
+			case "status":
+				return handleStatusCommand(parsed, reply);
+			case "resend":
+				return handleResendCommand(parsed, reply);
+			case "whoami":
+				return handleWhoamiCommand(parsed, reply);
+			case "pause":
+				return handlePauseCommand(parsed, reply);
+			case "resume":
+				return handleResumeCommand(parsed, reply);
 			case "help":
 				return handleHelpCommand(parsed, reply);
 			default:
@@ -566,14 +583,6 @@ export default function (pi: ExtensionAPI) {
 		pi.sendUserMessage(formatted, { deliverAs: "followUp" });
 	}
 
-	/** /ping — test connectivity */
-	async function handlePingCommand(
-		parsed: { sender: string; number: string; body: string; timestamp: number },
-		reply: (text: string) => void,
-	): Promise<void> {
-		reply("pong");
-	}
-
 	/** /help — list available commands */
 	async function handleHelpCommand(
 		parsed: { sender: string; number: string; body: string; timestamp: number },
@@ -585,12 +594,108 @@ export default function (pi: ExtensionAPI) {
 			"/abort — stop current generation\n" +
 			"/clear — start new session\n" +
 			"/stats [short|full|off] — toggle usage stats\n" +
-			"/ping — test connectivity\n" +
+			"/status — show live connection & model info\n" +
+			"/whoami — show model, directory, and session\n" +
+			"/resend — resend the last reply\n" +
+			"/pause — stop processing incoming messages\n" +
+			"/resume — resume processing\n" +
 			"/help — show this help",
 		);
 	}
 
-	/** Intercept commands from Signal: /model, /abort, /clear, /stats, /ping, /help */
+	/**
+	 * /status — report live status from in-memory state ONLY (no network
+	 * calls). Receiving this command already proves the daemon and SSE stream
+	 * are healthy, so we never need to hit the daemon — the reply is instant
+	 * and cannot hang. Note: if pi or the daemon is down, this command is never
+	 * received in the first place, so /status can only ever confirm "up".
+	 */
+	async function handleStatusCommand(
+		parsed: { sender: string; number: string; body: string; timestamp: number },
+		reply: (text: string) => void,
+	): Promise<void> {
+		const ctx = extCtx;
+		const model = ctx?.model;
+		const modelName = model?.name || model?.id || "unknown";
+		const providerSuffix = model?.provider ? ` (${model.provider})` : "";
+		const lines = [
+			"✅ pi is up and receiving Signal.",
+			`Account: ${PI_SIGNAL_ACCOUNT || "(not set)"}`,
+			`Primary: ${PI_SIGNAL_PRIMARY ? "yes" : "no"}`,
+			`SSE stream: ${sseConnected ? "connected" : "disconnected"}`,
+			`Model: ${modelName}${providerSuffix}`,
+			`Stats: ${statsMode}`,
+			`State: ${paused ? "⏸ paused (send /resume)" : "active"}`,
+		];
+		reply(lines.join("\n"));
+	}
+
+	/** /resend — re-send the last agent reply (recover a dropped message). */
+	async function handleResendCommand(
+		parsed: { sender: string; number: string; body: string; timestamp: number },
+		reply: (text: string) => void,
+	): Promise<void> {
+		if (!lastAgentReply) {
+			reply("Nothing to resend yet.");
+			return;
+		}
+		reply(lastAgentReply);
+	}
+
+	/** /whoami — show current model, working directory, and session. */
+	async function handleWhoamiCommand(
+		parsed: { sender: string; number: string; body: string; timestamp: number },
+		reply: (text: string) => void,
+	): Promise<void> {
+		const ctx = extCtx;
+		const model = ctx?.model;
+		const modelName = model?.name || model?.id || "unknown";
+		const providerSuffix = model?.provider ? ` (${model.provider})` : "";
+		let sessionName: string | undefined;
+		try {
+			sessionName = pi.getSessionName?.();
+		} catch {
+			sessionName = undefined;
+		}
+		const lines = [
+			`Model: ${modelName}${providerSuffix}`,
+			`Directory: ${ctx?.cwd || "unknown"}`,
+			`Session: ${sessionName || "(unnamed)"}`,
+			`Account: ${PI_SIGNAL_ACCOUNT || "(not set)"}`,
+			`Primary: ${PI_SIGNAL_PRIMARY ? "yes" : "no"}`,
+		];
+		reply(lines.join("\n"));
+	}
+
+	/** /pause — stop forwarding normal messages to the agent. */
+	async function handlePauseCommand(
+		parsed: { sender: string; number: string; body: string; timestamp: number },
+		reply: (text: string) => void,
+	): Promise<void> {
+		if (paused) {
+			reply("Already paused. Send /resume to re-enable.");
+			return;
+		}
+		paused = true;
+		reply(
+			"⏸ Paused. Incoming messages will be ignored until you send /resume. Commands still work.",
+		);
+	}
+
+	/** /resume — resume forwarding normal messages to the agent. */
+	async function handleResumeCommand(
+		parsed: { sender: string; number: string; body: string; timestamp: number },
+		reply: (text: string) => void,
+	): Promise<void> {
+		if (!paused) {
+			reply("Not paused — messages are already being processed.");
+			return;
+		}
+		paused = false;
+		reply("▶️ Resumed. Messages will be processed again.");
+	}
+
+	/** Intercept commands from Signal: /model, /abort, /clear, /stats, /status, /whoami, /resend, /pause, /resume, /help */
 	function injectMessage(parsed: {
 		sender: string;
 		number: string;
@@ -616,7 +721,13 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// Normal message — forward to agent
+		// Normal message — forward to agent, unless paused via /pause.
+		if (paused) {
+			sendToSignal(parsed.number, "⏸ Paused. Send /resume to re-enable.").catch(
+				() => {},
+			);
+			return;
+		}
 		forwardToAgent(parsed);
 	}
 
@@ -1007,6 +1118,9 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
+			// Remember the exact text sent so /resend can replay it.
+			lastAgentReply = fullText;
+
 			const ok = await sendToSignal(sender.number, fullText);
 			if (ok) {
 				console.log(`[signal] auto-reply sent to ${sender.number}`);
@@ -1058,6 +1172,8 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Send a text message to a Signal user. " +
 			"Recipient must be a phone number in E.164 format, e.g. +1234567890. " +
+			"To send to someone by name, first resolve their number with " +
+			"signal_list_contacts, then call this with that number. " +
 			"Uses the signal-cli daemon JSON-RPC API.",
 		parameters: Type.Object({
 			recipient: Type.String({
@@ -1111,9 +1227,14 @@ export default function (pi: ExtensionAPI) {
 					.catch(() => {});
 			}
 
-			// Clear signal sender context to prevent agent_end auto-reply
-			// from also sending (would cause duplicate messages)
-			currentSignalSender = null;
+			// Only suppress the agent_end auto-reply when the tool already
+			// delivered to SELF (Note-to-Self) — otherwise the two would
+			// duplicate. For a send to a DIFFERENT number, keep the context so
+			// agent_end delivers the agent's natural confirmation
+			// ("I've sent … to +1555…") back to Note-to-Self.
+			if (cleaned === PI_SIGNAL_ACCOUNT) {
+				currentSignalSender = null;
+			}
 
 			return {
 				content: [{ type: "text", text: `Message sent to ${cleaned}.` }],
@@ -1166,6 +1287,91 @@ export default function (pi: ExtensionAPI) {
 			return {
 				content: [{ type: "text", text: lines.join("\n") }],
 				details: { lines },
+			};
+		},
+	});
+
+	// ── Tool: signal_list_contacts ────────────────────────────────
+
+	pi.registerTool({
+		name: "signal_list_contacts",
+		label: "Signal Contacts",
+		description:
+			"List known Signal contacts as name → phone number pairs. Use this to " +
+			"resolve a person's name (e.g. \"Mike\") to their E.164 number BEFORE " +
+			"calling signal_send, since signal_send only accepts a phone number. " +
+			"Pass an optional `query` to filter by name or number. If more than one " +
+			"contact matches, ask the user which one before sending. Names only " +
+			"resolve if signal-cli knows them (synced address-book contact name or " +
+			"Signal profile name).",
+		parameters: Type.Object({
+			query: Type.Optional(
+				Type.String({
+					description:
+						"Optional case-insensitive filter. Returns only contacts whose name or number contains this text. Omit to list all contacts.",
+				}),
+			),
+		}),
+		async execute(
+			_toolCallId: string,
+			params: { query?: string },
+			_signal?: AbortSignal,
+		) {
+			const res = await daemonRpc("listContacts", {
+				account: PI_SIGNAL_ACCOUNT,
+				allRecipients: true,
+			});
+			if (!res.ok || !Array.isArray(res.result)) {
+				throw new Error(
+					`Could not list contacts: ${JSON.stringify(res.error || "unknown error")}`,
+				);
+			}
+
+			const contacts = (res.result as Array<Record<string, unknown>>)
+				.map((c) => {
+					const number = (c.number as string) || "";
+					// The display name lives under different fields depending on the
+					// signal-cli version — take the first one present.
+					const name =
+						(c.name as string) ||
+						(c.profileName as string) ||
+						[c.givenName, c.familyName]
+							.filter((p) => typeof p === "string" && p)
+							.join(" ")
+							.trim() ||
+						(c.username as string) ||
+						"";
+					return { name, number };
+				})
+				// Drop numberless contacts (can't be sent via signal_send) and self.
+				.filter((c) => c.number && c.number !== PI_SIGNAL_ACCOUNT);
+
+			const q = params.query?.toLowerCase().trim();
+			const filtered = q
+				? contacts.filter(
+						(c) =>
+							c.name.toLowerCase().includes(q) || c.number.includes(q),
+					)
+				: contacts;
+
+			// Named contacts first, then alphabetical by name.
+			filtered.sort(
+				(a, b) =>
+					(a.name ? 0 : 1) - (b.name ? 0 : 1) || a.name.localeCompare(b.name),
+			);
+
+			const lines = filtered.map((c) =>
+				c.name ? `${c.name} — ${c.number}` : c.number,
+			);
+			const text = lines.length
+				? lines.join("\n")
+				: q
+					? `No contacts match "${params.query}".`
+					: "No contacts found.";
+
+			return {
+				content: [{ type: "text", text }],
+				details: { contacts: filtered, query: params.query ?? null },
 			};
 		},
 	});
@@ -1245,6 +1451,117 @@ export default function (pi: ExtensionAPI) {
 					"error",
 				);
 			}
+		},
+	});
+
+	pi.registerCommand("signal-restart", {
+		description:
+			"Restart the Signal message-receive systemd service (start + stop in one step)",
+		async handler(_args: string, ctx: unknown) {
+			const extensionCtx = ctx as {
+				ui?: { notify: (msg: string, level: string) => void };
+			};
+
+			const result = await pi.exec(
+				"sudo",
+				["systemctl", "restart", "signal-receive.service"],
+				{ timeout: 20_000 },
+			);
+			if (result.code === 0) {
+				extensionCtx.ui?.notify?.("signal-receive.service restarted.", "info");
+			} else {
+				extensionCtx.ui?.notify?.(
+					`Failed to restart service: ${result.stderr || result.stdout}`,
+					"error",
+				);
+			}
+		},
+	});
+
+	pi.registerCommand("signal-logs", {
+		description:
+			"Show recent signal-receive service logs. Usage: /signal-logs [lines] (default 50)",
+		async handler(args: string, ctx: unknown) {
+			const extensionCtx = ctx as {
+				ui?: { notify: (msg: string, level: string) => void };
+			};
+
+			// Clamp to a sane range; default 50.
+			const parsed = parseInt(args.trim(), 10);
+			const n = Math.max(1, Math.min(500, Number.isNaN(parsed) ? 50 : parsed));
+
+			// No sudo: pi.exec runs without a TTY, so a sudo password prompt
+			// would stall until timeout. Reading a system unit's journal works
+			// without sudo for users in the systemd-journal/adm group; if it
+			// fails, we tell the user the sudo command to run themselves.
+			const result = await pi.exec(
+				"journalctl",
+				["-u", "signal-receive", "-n", String(n), "--no-pager"],
+				{ timeout: 10_000 },
+			);
+			if (result.code === 0) {
+				extensionCtx.ui?.notify?.(
+					result.stdout.trim() || "(no log output)",
+					"info",
+				);
+			} else {
+				extensionCtx.ui?.notify?.(
+					`Could not read logs (${result.stderr?.trim() || "permission denied?"}). ` +
+						`Try: sudo journalctl -u signal-receive -n ${n}`,
+					"error",
+				);
+			}
+		},
+	});
+
+	pi.registerCommand("signal-send", {
+		description:
+			"Send a Signal message from the TUI. Usage: /signal-send <+E164> <message>",
+		async handler(args: string, ctx: unknown) {
+			const extensionCtx = ctx as {
+				ui?: { notify: (msg: string, level: string) => void };
+			};
+
+			const trimmed = args.trim();
+			const sep = trimmed.indexOf(" ");
+			if (sep === -1) {
+				extensionCtx.ui?.notify?.(
+					"Usage: /signal-send <+E164> <message>",
+					"error",
+				);
+				return;
+			}
+
+			const rawNum = trimmed.slice(0, sep);
+			const message = trimmed.slice(sep + 1).trim();
+			const cleaned = rawNum.replace(/[\s\-().]/g, "");
+			if (!/^\+[1-9]\d{1,14}$/.test(cleaned)) {
+				extensionCtx.ui?.notify?.(
+					`Invalid number "${rawNum}". Use E.164 format, e.g. +1234567890.`,
+					"error",
+				);
+				return;
+			}
+			if (!message) {
+				extensionCtx.ui?.notify?.("Message is empty.", "error");
+				return;
+			}
+
+			// For self-recipient, use the resolved UUID so signal-cli routes
+			// through sendSelfMessage → grey (synced) rendering.
+			const isSelf = cleaned === PI_SIGNAL_ACCOUNT;
+			const targetId = isSelf && resolvedAccountId ? resolvedAccountId : cleaned;
+			const res = await daemonRpc("send", {
+				account: PI_SIGNAL_ACCOUNT,
+				recipient: [targetId],
+				message,
+			});
+			extensionCtx.ui?.notify?.(
+				res.ok
+					? `Message sent to ${cleaned}.`
+					: `Send failed: ${JSON.stringify(res.error || "unknown error")}`,
+				res.ok ? "info" : "error",
+			);
 		},
 	});
 

@@ -89,6 +89,9 @@ pi extension (signal.ts)
       ├── /abort           → stop current generation
       ├── /clear           → new session / reset context
       ├── /stats [on/off]  → toggle usage stats
+      ├── /status /whoami  → in-memory status (no network, no hang)
+      ├── /resend          → replay last reply
+      ├── /pause /resume   → gate message forwarding
       └── else             → pi.sendUserMessage() → LLM processes
          └── agent_end → auto-reply via daemonRpc("send") + stats footer
             └── Swap 👀 → ✅
@@ -136,8 +139,20 @@ Send these as Note-to-Self messages from your phone. Commands are intercepted by
 | `/abort` | — | Stop the current LLM generation immediately. Swaps 👀 → 🛑 on your original message. |
 | `/clear` | — | Start a fresh session — clears conversation context and restarts. Aborts any in-progress generation first. |
 | `/stats` | `short` / `full` / `off` | View current stats mode or change it. `/stats full` enables detailed stats, `/stats off` disables them. |
-| `/ping` | — | Test end-to-end connectivity. Returns "pong" via the Signal send path. |
+| `/status` | — | Report live connection & model info from in-memory state (no network call, cannot hang). **Only ever answers when pi is up** — if pi or the daemon is down, the message is never received, so no reply comes. Use it as a liveness ping, not a down-detector. |
+| `/whoami` | — | Show current model/provider, working directory, and session name. |
+| `/resend` | — | Re-send the exact text of the last reply. Recovers a message Signal dropped without re-running the LLM. |
+| `/pause` | — | Stop forwarding incoming messages to the agent. Commands (including `/resume`) still work. |
+| `/resume` | — | Resume forwarding messages to the agent. |
 | `/help` | — | Show a list of available phone commands. |
+
+### Sending to another number from the phone
+
+There is no `/send` command — instead, ask the LLM naturally: *"summarize the last email and text it to +15551234567."* The agent calls the `signal_send` tool with that recipient, which delivers the message to that number. Because the recipient is not yourself, the extension keeps the reply context, so the agent's own confirmation (e.g. *"I've sent the summary to +15551234567."*) comes back to your Note-to-Self.
+
+You can also refer to people **by name** — *"send this to Mike."* The agent first calls `signal_list_contacts` (optionally with a `query` like "Mike") to resolve the name to a number, asks you which one if several match, then sends. A name only resolves if signal-cli knows it: a contact name synced from your phone's address book, or the person's Signal profile name. Contacts with no phone number (uuid-only) are not offered, since `signal_send` needs an E.164 number.
+
+> The confirmation is the agent's final message. If a model returns only the tool call with no closing text, no confirmation is sent — but in practice models narrate after sending. When the agent sends to **yourself**, the self auto-reply is suppressed to avoid a duplicate.
 
 ### `/model` — Fuzzy Matching Details
 
@@ -182,7 +197,10 @@ These are also available as slash commands in pi's interactive TUI mode:
 | `/signal-setup` | Interactive setup wizard |
 | `/signal-start` | Start systemd service |
 | `/signal-stop` | ⚠️ Stop systemd service (stops Signal message receiving) |
+| `/signal-restart` | Restart the systemd service (recovers a wedged daemon / TIME_WAIT) |
 | `/signal-status` | Show connection status, account, SSE stream status, stats mode |
+| `/signal-logs [n]` | Show the last `n` (default 50) journal lines for `signal-receive`. Runs without sudo; if permission is denied it prints the `sudo journalctl` command to run manually. |
+| `/signal-send <+E164> <msg>` | Send a Signal message from the TUI (validates E.164, reuses the daemon send path) |
 | `/signal-model <name>` | Switch model by fuzzy-matching partial name |
 | `/signal-abort` | Stop current LLM generation |
 | `/signal-stats [short\|full\|off]` | View or toggle stats mode |
@@ -193,6 +211,7 @@ These are also available as slash commands in pi's interactive TUI mode:
 |---|---|
 | `signal_send` | Send a Signal message to a phone number (E.164) |
 | `signal_status` | Check connection status and health |
+| `signal_list_contacts` | List contacts as name → number pairs (optional `query` filter) so the agent can resolve a name to a number before `signal_send` |
 
 ---
 
