@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.1
+
+### Security
+- **Quiet daemon by default:** `PI_SIGNAL_QUIET_DAEMON` now defaults to `true`, so signal-cli daemon output no longer lands in `journalctl`. Set it to `false` to surface daemon output for debugging. *(Applies to new/re-run setups; existing hosts pick it up after re-running `setup.sh` or restarting the service with the updated script.)*
+- **Contact-name sanitization:** display names and usernames returned by `signal_list_contacts` are third-party controlled and are now stripped of control characters, newlines, and zero-width/bidi marks (and length-capped) before reaching the agent, reducing prompt-injection risk from a crafted Signal profile name.
+
 ## 1.1.0
 
 ### Added

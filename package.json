@@ -1,6 +1,6 @@
 {
   "name": "@aalzubidy/pi-signal",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Connect pi to Signal Messenger via native signal-cli daemon",
   "keywords": ["pi-package"],
   "repository": {

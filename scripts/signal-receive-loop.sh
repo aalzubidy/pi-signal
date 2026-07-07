@@ -28,12 +28,12 @@ if [ -z "$PI_SIGNAL_ACCOUNT" ]; then
 fi
 
 # Determine daemon output redirection
-# When QUIET_DAEMON is true, redirect stdout/stderr to /dev/null so message
-# content doesn't appear in journalctl. Default is false (no redirect,
-# systemd captures stdout naturally into the journal).
-if [ "${PI_SIGNAL_QUIET_DAEMON:-false}" = "true" ] || \
-   [ "${PI_SIGNAL_QUIET_DAEMON:-false}" = "1" ] || \
-   [ "${PI_SIGNAL_QUIET_DAEMON:-false}" = "yes" ]; then
+# When QUIET_DAEMON is true (the default), redirect stdout/stderr to /dev/null
+# so message content never appears in journalctl. Set PI_SIGNAL_QUIET_DAEMON=false
+# to let systemd capture daemon output into the journal (useful for debugging).
+if [ "${PI_SIGNAL_QUIET_DAEMON:-true}" = "true" ] || \
+   [ "${PI_SIGNAL_QUIET_DAEMON:-true}" = "1" ] || \
+   [ "${PI_SIGNAL_QUIET_DAEMON:-true}" = "yes" ]; then
 	DAEMON_REDIRECT=">/dev/null 2>&1"
 else
 	DAEMON_REDIRECT=""
